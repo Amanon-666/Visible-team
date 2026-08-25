@@ -13,10 +13,19 @@ The bundled helper is a dependency-free Python CLI backed by SQLite. The Leader 
 - Use the collaboration version for compare-and-set when concurrent or stale updates are plausible.
 - Add context with explicit target Worker IDs. Query and acknowledge pending updates per Worker rather than broadcasting.
 - The database is a coordination ledger, not a substitute for the host's visible task tools. Reconcile it with actual task records after an uncertain host result.
+- Worker lifecycle completion is separate from delivery acceptance. A completed Worker must have a submitted delivery with a summary or result/artifact reference; a host task that is complete but has no verifiable result is recorded as `needs_attention`.
+- Failure categories are advisory state, not retry instructions. `transient` is retryable in principle, but the Leader must explicitly trigger any host retry; the helper and coordinator never loop or retry automatically.
+- Host observations are facts supplied by the Leader or a host adapter. The SQLite helper never queries or claims to query Codex.
 
 ## Commands
 
 Run commands from the plugin root. Add `--pretty` when human-readable JSON is useful.
+
+Opening the helper runs the explicit migration. It can also be checked directly:
+
+```bash
+python3 scripts/visible_team_state.py --db <chosen-db> migrate
+```
 
 ```bash
 python3 scripts/visible_team_state.py --db <chosen-db> init \
@@ -39,6 +48,17 @@ python3 scripts/visible_team_state.py --db <chosen-db> attach-worker \
   --thread-id <created-thread-id> \
   --idempotency-key <stable-operation-id>
 
+python3 scripts/visible_team_state.py --db <chosen-db> reconcile-worker-creation \
+  --collaboration-id <stable-id> --worker-id <logical-worker-id> \
+  --outcome missing|retry|attached [--thread-id <thread-id>] \
+  --idempotency-key <stable-operation-id>
+
+python3 scripts/visible_team_state.py --db <chosen-db> update-worker-config \
+  --collaboration-id <stable-id> \
+  --worker-id <logical-worker-id> \
+  --model <model> --thinking <effort> \
+  --idempotency-key <stable-operation-id>
+
 python3 scripts/visible_team_state.py --db <chosen-db> add-context \
   --collaboration-id <stable-id> \
   --summary <changed-decision-or-evidence> \
@@ -56,6 +76,25 @@ python3 scripts/visible_team_state.py --db <chosen-db> acknowledge \
   --through-version <version> \
   --idempotency-key <stable-operation-id>
 
+python3 scripts/visible_team_state.py --db <chosen-db> set-delivery-status \
+  --collaboration-id <stable-id> --worker-id <logical-worker-id> \
+  --status submitted --summary <short-result-summary> \
+  --artifact-ref <optional-readable-reference> \
+  --idempotency-key <stable-operation-id>
+
+python3 scripts/visible_team_state.py --db <chosen-db> record-observation \
+  --collaboration-id <stable-id> --worker-id <logical-worker-id> \
+  --task-exists yes --host-status <host-state> --result-available yes \
+  --lease-until <optional-iso-time> --idempotency-key <stable-operation-id>
+
+python3 scripts/visible_team_state.py --db <chosen-db> record-failure \
+  --collaboration-id <stable-id> --worker-id <logical-worker-id> \
+  --category transient --message <what-failed> \
+  --idempotency-key <stable-operation-id>
+
+python3 scripts/visible_team_state.py --db <chosen-db> resume \
+  --collaboration-id <stable-id>
+
 python3 scripts/visible_team_state.py --db <chosen-db> snapshot \
   --collaboration-id <stable-id>
 ```
@@ -64,3 +103,12 @@ python3 scripts/visible_team_state.py --db <chosen-db> snapshot \
 
 Use `set-worker-status` and `set-collaboration-status` for lifecycle changes. Pass `--expected-version` when a stale writer must be rejected.
 
+Delivery states advance as `pending → submitted → received → accepted`; a
+Leader may request revision or mark `needs_attention`. `needs_attention` cannot
+skip back to `accepted`: first obtain a verifiable result and submit/receive it.
+An adapter creation request is durably reserved before the host call. If the
+host result is uncertain, `resume` exposes `reconcile_creation`; the Leader must
+confirm `missing`/`retry` or `attached` before another create request is allowed.
+The optional `scripts/visible_team_coordination.py` module provides a small
+`HostAdapter` protocol and `ActionEnvelope`; it does not implement a Codex API,
+background polling, or automatic retries.
