@@ -97,7 +97,12 @@ python3 scripts/visible_team_state.py --db <chosen-db> resume \
 
 python3 scripts/visible_team_state.py --db <chosen-db> snapshot \
   --collaboration-id <stable-id>
+
+python3 scripts/visible_team_usage.py --db <chosen-db> \
+  --collaboration-id <stable-id> [--codex-home <codex-home>] [--json]
 ```
+
+`visible_team_usage.py` 只读宿主 rollout 的最新 `token_count`；rollout 明细不可用时才使用 `state_*.sqlite` 的总量回退，不显示价格、额度或限制。
 
 `--target all` is available for a genuinely global change. Prefer explicit affected Worker IDs.
 
