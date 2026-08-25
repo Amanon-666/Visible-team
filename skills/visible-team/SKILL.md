@@ -40,6 +40,8 @@ For ordinary short work, use the current task history and host task records; do 
 
 The helper complements rather than replaces judgment or host tools. Use it to retain stable collaboration and Worker identities, approved responsibilities, lifecycle state, versions, and targeted context deliveries. Plan a logical Worker before creating its visible task, then attach the returned thread ID. After an uncertain host result, reconcile actual visible tasks before retrying. Keep task decomposition, relevance, model choice, semantic review, and corrections with the Leader.
 
+The state helper also records a separate delivery handshake, host observations, and classified failures. A Worker lifecycle marked `completed` must have a submitted delivery with a summary or result/artifact reference; a host-reported completion without a verifiable result is `needs_attention`, not acceptance. `transient` failures may be retryable, but neither the helper nor its adapter retries automatically. The SQLite ledger does not query Codex; the Leader or an injected host adapter writes observations obtained from the host.
+
 ## Use Suitable Visible Workers
 
 - After confirmation, create Workers only within the approved allocation. Prefer the smallest useful number.
