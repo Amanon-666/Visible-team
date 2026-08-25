@@ -35,6 +35,32 @@ WORKER_STATUSES = (
 )
 TERMINAL_COLLABORATION_STATUSES = {"completed", "cancelled"}
 TERMINAL_WORKER_STATUSES = {"completed", "failed", "cancelled"}
+DELIVERY_STATUSES = (
+    "pending",
+    "submitted",
+    "received",
+    "accepted",
+    "revision_requested",
+    "needs_attention",
+)
+DELIVERY_TRANSITIONS = {
+    "pending": {"submitted", "needs_attention"},
+    "submitted": {"received", "revision_requested", "needs_attention"},
+    "received": {"accepted", "revision_requested", "needs_attention"},
+    "revision_requested": {"submitted", "needs_attention"},
+    "needs_attention": {"submitted", "received", "needs_attention"},
+    "accepted": set(),
+}
+FAILURE_CATEGORIES = ("transient", "permanent", "decision", "authorization", "conflict")
+FAILURE_ACTIONS = {
+    "transient": {"kind": "retry", "owner": "leader", "retryable": True, "automatic": False},
+    "permanent": {"kind": "stop", "owner": "leader", "retryable": False, "automatic": False},
+    "decision": {"kind": "decide", "owner": "leader", "retryable": False, "automatic": False},
+    "authorization": {"kind": "authorize", "owner": "user_or_leader", "retryable": False, "automatic": False},
+    "conflict": {"kind": "resolve_conflict", "owner": "leader", "retryable": False, "automatic": False},
+}
+STATE_SCHEMA_VERSION = 2
+SKILL_VERSION = "visible-team/2"
 
 
 class StateError(RuntimeError):
@@ -53,15 +79,129 @@ def emit(value: Any, pretty: bool = False, *, stream: Any = sys.stdout) -> None:
     print(text, file=stream)
 
 
-def connect(db_path: str) -> sqlite3.Connection:
-    path = Path(db_path).expanduser().resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, timeout=10)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA journal_mode = WAL")
-    connection.execute("PRAGMA busy_timeout = 10000")
-    connection.executescript(
+def _column_exists(connection: sqlite3.Connection, table_name: str, column_name: str) -> bool:
+    return any(
+        row[1] == column_name
+        for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    )
+
+
+def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
+    return (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table_name,)
+        ).fetchone()
+        is not None
+    )
+
+
+def _validate_v2_schema(connection: sqlite3.Connection) -> None:
+    required_tables = (
+        "collaborations",
+        "workers",
+        "context_updates",
+        "context_targets",
+        "events",
+        "host_observations",
+        "failures",
+    )
+    missing = [table for table in required_tables if not _table_exists(connection, table)]
+    if missing:
+        raise StateError(f"Database schema 2 is incomplete; missing tables: {', '.join(missing)}")
+    required_columns = {
+        "collaborations": (
+            "collaboration_id",
+            "objective",
+            "leader_thread_id",
+            "status",
+            "version",
+            "created_at",
+            "updated_at",
+            "skill_version",
+        ),
+        "workers": (
+            "collaboration_id",
+            "worker_id",
+            "thread_id",
+            "title",
+            "model",
+            "thinking",
+            "responsibility",
+            "status",
+            "last_context_version",
+            "created_at",
+            "updated_at",
+            "delivery_status",
+            "delivery_summary",
+            "artifact_ref",
+            "result_available",
+            "delivery_note",
+            "delivery_updated_at",
+        ),
+        "context_updates": (
+            "update_id",
+            "collaboration_id",
+            "version",
+            "summary",
+            "source_ref",
+            "created_at",
+            "idempotency_key",
+        ),
+        "context_targets": ("update_id", "worker_id", "delivered_at"),
+        "events": (
+            "event_id",
+            "collaboration_id",
+            "version",
+            "event_type",
+            "actor",
+            "payload_json",
+            "idempotency_key",
+            "created_at",
+        ),
+        "host_observations": (
+            "collaboration_id",
+            "worker_id",
+            "observed_at",
+            "task_exists",
+            "host_status",
+            "result_available",
+            "last_contact_at",
+            "lease_until",
+            "needs_attention",
+            "note",
+            "source_ref",
+            "updated_at",
+        ),
+        "failures": (
+            "failure_id",
+            "collaboration_id",
+            "worker_id",
+            "category",
+            "message",
+            "action_kind",
+            "action_owner",
+            "automatic_retry",
+            "source_ref",
+            "created_at",
+            "idempotency_key",
+            "resolved_at",
+        ),
+    }
+    missing_columns = [
+        f"{table}.{column}"
+        for table, columns in required_columns.items()
+        for column in columns
+        if not _column_exists(connection, table, column)
+    ]
+    if missing_columns:
+        raise StateError(
+            f"Database schema 2 is incomplete; missing columns: {', '.join(missing_columns)}"
+        )
+
+
+def _create_v1_schema(connection: sqlite3.Connection) -> None:
+    """Create the original schema, without silently changing its version."""
+    statements = (
         """
         CREATE TABLE IF NOT EXISTS collaborations (
             collaboration_id TEXT PRIMARY KEY,
@@ -72,7 +212,8 @@ def connect(db_path: str) -> sqlite3.Connection:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
-
+        """,
+        """
         CREATE TABLE IF NOT EXISTS workers (
             collaboration_id TEXT NOT NULL,
             worker_id TEXT NOT NULL,
@@ -90,7 +231,8 @@ def connect(db_path: str) -> sqlite3.Connection:
             FOREIGN KEY (collaboration_id) REFERENCES collaborations(collaboration_id)
                 ON DELETE CASCADE
         );
-
+        """,
+        """
         CREATE TABLE IF NOT EXISTS context_updates (
             update_id INTEGER PRIMARY KEY AUTOINCREMENT,
             collaboration_id TEXT NOT NULL,
@@ -104,7 +246,8 @@ def connect(db_path: str) -> sqlite3.Connection:
             FOREIGN KEY (collaboration_id) REFERENCES collaborations(collaboration_id)
                 ON DELETE CASCADE
         );
-
+        """,
+        """
         CREATE TABLE IF NOT EXISTS context_targets (
             update_id INTEGER NOT NULL,
             worker_id TEXT NOT NULL,
@@ -113,7 +256,8 @@ def connect(db_path: str) -> sqlite3.Connection:
             FOREIGN KEY (update_id) REFERENCES context_updates(update_id)
                 ON DELETE CASCADE
         );
-
+        """,
+        """
         CREATE TABLE IF NOT EXISTS events (
             event_id INTEGER PRIMARY KEY AUTOINCREMENT,
             collaboration_id TEXT NOT NULL,
@@ -127,14 +271,124 @@ def connect(db_path: str) -> sqlite3.Connection:
             FOREIGN KEY (collaboration_id) REFERENCES collaborations(collaboration_id)
                 ON DELETE CASCADE
         );
-
+        """,
+        """
         CREATE INDEX IF NOT EXISTS context_targets_pending_idx
             ON context_targets(worker_id, delivered_at);
+        """,
+        """
         CREATE INDEX IF NOT EXISTS events_collaboration_idx
             ON events(collaboration_id, event_id);
-        PRAGMA user_version = 1;
-        """
+        """,
     )
+    for statement in statements:
+        connection.execute(statement)
+
+
+def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+    """Add reliability state while preserving every v1 row and identifier."""
+    if not _column_exists(connection, "collaborations", "skill_version"):
+        connection.execute(
+            "ALTER TABLE collaborations ADD COLUMN skill_version TEXT NOT NULL DEFAULT 'visible-team/2'",
+        )
+    connection.execute(
+        "UPDATE collaborations SET skill_version = 'visible-team/2' "
+        "WHERE skill_version IS NULL OR skill_version = ''"
+    )
+    worker_columns = (
+        ("delivery_status", "TEXT NOT NULL DEFAULT 'pending'"),
+        ("delivery_summary", "TEXT"),
+        ("artifact_ref", "TEXT"),
+        ("result_available", "INTEGER NOT NULL DEFAULT 0"),
+        ("delivery_note", "TEXT"),
+        ("delivery_updated_at", "TEXT"),
+    )
+    for column_name, definition in worker_columns:
+        if not _column_exists(connection, "workers", column_name):
+            connection.execute(f"ALTER TABLE workers ADD COLUMN {column_name} {definition}")
+    statements = (
+        """
+        CREATE TABLE IF NOT EXISTS host_observations (
+            collaboration_id TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            task_exists INTEGER NOT NULL,
+            host_status TEXT NOT NULL,
+            result_available INTEGER NOT NULL,
+            last_contact_at TEXT,
+            lease_until TEXT,
+            needs_attention INTEGER NOT NULL DEFAULT 0,
+            note TEXT,
+            source_ref TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (collaboration_id, worker_id),
+            FOREIGN KEY (collaboration_id, worker_id)
+                REFERENCES workers(collaboration_id, worker_id)
+                ON DELETE CASCADE
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS failures (
+            failure_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            collaboration_id TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            category TEXT NOT NULL,
+            message TEXT NOT NULL,
+            action_kind TEXT NOT NULL,
+            action_owner TEXT NOT NULL,
+            automatic_retry INTEGER NOT NULL,
+            source_ref TEXT,
+            created_at TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            resolved_at TEXT,
+            UNIQUE (collaboration_id, idempotency_key),
+            FOREIGN KEY (collaboration_id, worker_id)
+                REFERENCES workers(collaboration_id, worker_id)
+                ON DELETE CASCADE
+        );
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS failures_worker_idx
+            ON failures(collaboration_id, worker_id, failure_id);
+        """,
+    )
+    for statement in statements:
+        connection.execute(statement)
+
+
+def migrate(connection: sqlite3.Connection) -> int:
+    """Run explicit, monotonic schema migrations and return the schema version."""
+    with immediate_transaction(connection):
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version < 0 or version > STATE_SCHEMA_VERSION:
+            raise StateError(
+                f"Database schema {version} is outside supported range 0..{STATE_SCHEMA_VERSION}"
+            )
+        if version == 0:
+            _create_v1_schema(connection)
+            version = 1
+            connection.execute("PRAGMA user_version = 1")
+        if version == 1:
+            _migrate_v1_to_v2(connection)
+            connection.execute("PRAGMA user_version = 2")
+            version = 2
+        if version > STATE_SCHEMA_VERSION:
+            raise StateError(
+                f"Database schema {version} is newer than supported schema {STATE_SCHEMA_VERSION}"
+            )
+        _validate_v2_schema(connection)
+    return version
+
+
+def connect(db_path: str) -> sqlite3.Connection:
+    path = Path(db_path).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=10)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA busy_timeout = 10000")
+    migrate(connection)
     return connection
 
 
@@ -231,8 +485,45 @@ def add_event(
     )
 
 
+def _bool_value(value: Any) -> bool:
+    return bool(int(value)) if isinstance(value, (int, bool)) else bool(value)
+
+
+def _host_observation(connection: sqlite3.Connection, collaboration_id: str, worker_id: str) -> dict[str, Any] | None:
+    row = connection.execute(
+        "SELECT * FROM host_observations WHERE collaboration_id = ? AND worker_id = ?",
+        (collaboration_id, worker_id),
+    ).fetchone()
+    if row is None:
+        return None
+    item = dict(row)
+    for key in ("task_exists", "result_available", "needs_attention"):
+        item[key] = _bool_value(item[key])
+    return item
+
+
+def _latest_failure(connection: sqlite3.Connection, collaboration_id: str, worker_id: str) -> dict[str, Any] | None:
+    row = connection.execute(
+        """
+        SELECT failure_id, category, message, action_kind, action_owner,
+               automatic_retry, source_ref, created_at, resolved_at
+        FROM failures
+        WHERE collaboration_id = ? AND worker_id = ?
+        ORDER BY failure_id DESC LIMIT 1
+        """,
+        (collaboration_id, worker_id),
+    ).fetchone()
+    if row is None:
+        return None
+    item = dict(row)
+    item["automatic_retry"] = _bool_value(item["automatic_retry"])
+    item["retryable"] = item["category"] == "transient"
+    return item
+
+
 def snapshot(connection: sqlite3.Connection, collaboration_id: str) -> dict[str, Any]:
     collaboration = dict(collaboration_row(connection, collaboration_id))
+    collaboration["schema_version"] = STATE_SCHEMA_VERSION
     workers = []
     rows = connection.execute(
         """
@@ -256,6 +547,13 @@ def snapshot(connection: sqlite3.Connection, collaboration_id: str) -> dict[str,
     for row in rows:
         item = dict(row)
         item["pending_updates"] = int(item["pending_updates"] or 0)
+        item["result_available"] = _bool_value(item["result_available"])
+        item["host_observation"] = _host_observation(
+            connection, collaboration_id, item["worker_id"]
+        )
+        item["latest_failure"] = _latest_failure(
+            connection, collaboration_id, item["worker_id"]
+        )
         workers.append(item)
     collaboration["workers"] = workers
     return collaboration
@@ -362,6 +660,10 @@ def command_attach_worker(connection: sqlite3.Connection, args: argparse.Namespa
             return result
         worker = worker_row(connection, args.collaboration_id, args.worker_id)
         if worker["thread_id"] is not None:
+            if worker["thread_id"] == args.thread_id:
+                result = snapshot(connection, args.collaboration_id)
+                result["reconciled"] = True
+                return result
             raise StateError(
                 "Worker is already attached; retry with the original idempotency key"
             )
@@ -390,6 +692,188 @@ def command_attach_worker(connection: sqlite3.Connection, args: argparse.Namespa
         return snapshot(connection, args.collaboration_id)
 
 
+def latest_worker_creation_event(
+    connection: sqlite3.Connection, collaboration_id: str, worker_id: str
+) -> dict[str, Any] | None:
+    rows = connection.execute(
+        """
+        SELECT event_id, event_type, payload_json, created_at
+        FROM events
+        WHERE collaboration_id = ?
+          AND event_type IN ('worker_creation_requested', 'worker_creation_reconciled')
+        ORDER BY event_id DESC
+        """,
+        (collaboration_id,),
+    ).fetchall()
+    for row in rows:
+        payload = json.loads(row["payload_json"])
+        if payload.get("worker_id") == worker_id:
+            return {
+                "event_id": row["event_id"],
+                "event_type": row["event_type"],
+                "created_at": row["created_at"],
+                **payload,
+            }
+    return None
+
+
+def command_reserve_host_action(
+    connection: sqlite3.Connection, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Reserve one adapter action; creation reservations are singleton per Worker."""
+    with immediate_transaction(connection):
+        if replayed_event(connection, args.collaboration_id, args.idempotency_key):
+            return {"reserved": False, "replayed": True, "reason": "same_idempotency_key"}
+        worker = worker_row(connection, args.collaboration_id, args.worker_id)
+        action = args.action
+        if action == "create_worker":
+            if worker["status"] != "planned":
+                raise StateError("Only a planned Worker without a thread can be created")
+            if worker["thread_id"] is not None:
+                return {"reserved": False, "reason": "already_attached"}
+            latest = latest_worker_creation_event(
+                connection, args.collaboration_id, args.worker_id
+            )
+            if latest is not None and latest["event_type"] == "worker_creation_requested":
+                return {"reserved": False, "reason": "creation_uncertain"}
+            event_type = "worker_creation_requested"
+        else:
+            event_type = "host_action_requested"
+        version = bump_version(connection, args.collaboration_id, args.expected_version)
+        add_event(
+            connection,
+            args.collaboration_id,
+            version,
+            event_type,
+            "leader",
+            {
+                "action": action,
+                "worker_id": args.worker_id,
+                "thread_id": worker["thread_id"],
+            },
+            args.idempotency_key,
+        )
+        return {"reserved": True, "version": version, "action": action}
+
+
+def command_reconcile_worker_creation(
+    connection: sqlite3.Connection, args: argparse.Namespace
+) -> dict[str, Any]:
+    with immediate_transaction(connection):
+        if replayed_event(connection, args.collaboration_id, args.idempotency_key):
+            result = snapshot(connection, args.collaboration_id)
+            result["replayed"] = True
+            return result
+        worker = worker_row(connection, args.collaboration_id, args.worker_id)
+        if args.outcome not in {"missing", "retry", "attached"}:
+            raise StateError("Creation reconciliation outcome must be missing, retry, or attached")
+        if worker["status"] != "planned" and worker["thread_id"] is None:
+            raise StateError("Only a planned Worker without a thread can reconcile creation")
+        if args.outcome == "attached":
+            if not args.thread_id:
+                raise StateError("An attached reconciliation requires --thread-id")
+            if worker["thread_id"] is not None and worker["thread_id"] != args.thread_id:
+                raise StateError("Worker is already attached to a different visible thread")
+        elif worker["thread_id"] is not None:
+            raise StateError("An attached Worker cannot be reconciled as missing or retry")
+        version = bump_version(connection, args.collaboration_id, args.expected_version)
+        timestamp = now()
+        if args.outcome == "attached" and worker["thread_id"] is None:
+            try:
+                connection.execute(
+                    """
+                    UPDATE workers SET thread_id = ?, status = 'active', updated_at = ?
+                    WHERE collaboration_id = ? AND worker_id = ?
+                    """,
+                    (args.thread_id, timestamp, args.collaboration_id, args.worker_id),
+                )
+            except sqlite3.IntegrityError as error:
+                raise StateError("That visible thread is already attached to another Worker") from error
+            add_event(
+                connection,
+                args.collaboration_id,
+                version,
+                "worker_attached",
+                "leader",
+                {"worker_id": args.worker_id, "thread_id": args.thread_id, "reconciled": True},
+                f"{args.idempotency_key}:attached",
+            )
+        add_event(
+            connection,
+            args.collaboration_id,
+            version,
+            "worker_creation_reconciled",
+            "leader",
+            {
+                "worker_id": args.worker_id,
+                "outcome": args.outcome,
+                "thread_id": args.thread_id,
+            },
+            args.idempotency_key,
+        )
+        result = snapshot(connection, args.collaboration_id)
+        result["creation_reconciliation"] = {
+            "worker_id": args.worker_id,
+            "outcome": args.outcome,
+            "thread_id": args.thread_id,
+        }
+        return result
+
+
+def command_update_worker_config(
+    connection: sqlite3.Connection, args: argparse.Namespace
+) -> dict[str, Any]:
+    with immediate_transaction(connection):
+        if replayed_event(connection, args.collaboration_id, args.idempotency_key):
+            result = snapshot(connection, args.collaboration_id)
+            result["replayed"] = True
+            return result
+        collaboration = collaboration_row(connection, args.collaboration_id)
+        if collaboration["status"] in TERMINAL_COLLABORATION_STATUSES:
+            raise StateError("A terminal collaboration cannot update Worker configuration")
+        current = worker_row(connection, args.collaboration_id, args.worker_id)
+        if current["status"] in TERMINAL_WORKER_STATUSES:
+            raise StateError("A terminal Worker cannot have its model or thinking updated")
+        if args.model is not None and not args.model.strip():
+            raise StateError("Worker model cannot be empty")
+        if args.thinking is not None and not args.thinking.strip():
+            raise StateError("Worker thinking cannot be empty")
+        model = args.model if args.model is not None else current["model"]
+        thinking = args.thinking if args.thinking is not None else current["thinking"]
+        if model == current["model"] and thinking == current["thinking"]:
+            raise StateError("Worker config update must change model or thinking")
+        version = bump_version(connection, args.collaboration_id, args.expected_version)
+        timestamp = now()
+        connection.execute(
+            """
+            UPDATE workers SET model = ?, thinking = ?, updated_at = ?
+            WHERE collaboration_id = ? AND worker_id = ?
+            """,
+            (model, thinking, timestamp, args.collaboration_id, args.worker_id),
+        )
+        add_event(
+            connection,
+            args.collaboration_id,
+            version,
+            "worker_config_updated",
+            "leader",
+            {
+                "worker_id": args.worker_id,
+                "from": {"model": current["model"], "thinking": current["thinking"]},
+                "to": {"model": model, "thinking": thinking},
+            },
+            args.idempotency_key,
+        )
+        result = snapshot(connection, args.collaboration_id)
+        result["worker_config_update"] = {
+            "worker_id": args.worker_id,
+            "model": model,
+            "thinking": thinking,
+            "version": version,
+        }
+        return result
+
+
 def resolve_targets(
     connection: sqlite3.Connection, collaboration_id: str, targets: list[str]
 ) -> list[str]:
@@ -411,7 +895,9 @@ def resolve_targets(
     else:
         resolved = list(dict.fromkeys(targets))
         for worker_id in resolved:
-            worker_row(connection, collaboration_id, worker_id)
+            worker = worker_row(connection, collaboration_id, worker_id)
+            if worker["status"] in TERMINAL_WORKER_STATUSES:
+                raise StateError(f"Cannot target terminal Worker {worker_id!r} with context")
     if not resolved:
         raise StateError("The context update has no active target Workers")
     return resolved
@@ -563,6 +1049,95 @@ def command_set_collaboration_status(
         return snapshot(connection, args.collaboration_id)
 
 
+def _delivery_value(args: argparse.Namespace, current: sqlite3.Row, name: str) -> Any:
+    value = getattr(args, name, None)
+    current_name = {"summary": "delivery_summary", "artifact_ref": "artifact_ref"}.get(name, name)
+    return current[current_name] if value is None else value
+
+
+def command_set_delivery_status(
+    connection: sqlite3.Connection, args: argparse.Namespace
+) -> dict[str, Any]:
+    with immediate_transaction(connection):
+        if replayed_event(connection, args.collaboration_id, args.idempotency_key):
+            result = snapshot(connection, args.collaboration_id)
+            result["replayed"] = True
+            return result
+        current = worker_row(connection, args.collaboration_id, args.worker_id)
+        old_status = current["delivery_status"]
+        new_status = args.status
+        actor = getattr(args, "actor", "leader")
+        if actor == "worker" and new_status in {
+            "received",
+            "accepted",
+            "revision_requested",
+            "needs_attention",
+        }:
+            raise StateError("A Worker may submit a delivery, but only the Leader may confirm or revise it")
+        if new_status != old_status and new_status not in DELIVERY_TRANSITIONS.get(old_status, set()):
+            raise StateError(f"Invalid delivery transition: {old_status} -> {new_status}")
+        summary = _delivery_value(args, current, "summary")
+        artifact_ref = _delivery_value(args, current, "artifact_ref")
+        if old_status == "needs_attention" and new_status in {"submitted", "received"}:
+            if getattr(args, "summary", None) is None and getattr(args, "artifact_ref", None) is None:
+                raise StateError(
+                    "A needs_attention delivery must include a new summary or artifact reference"
+                )
+        result_available = bool(
+            getattr(args, "result_available", False)
+            or current["result_available"]
+            or bool(summary or artifact_ref)
+        )
+        if new_status in {"submitted", "received", "accepted"} and not (summary or artifact_ref):
+            raise StateError("A delivery submission needs --summary or --artifact-ref")
+        if new_status == "accepted" and not result_available:
+            raise StateError("A delivery cannot be accepted before a result is available")
+        version = bump_version(connection, args.collaboration_id, args.expected_version)
+        timestamp = now()
+        connection.execute(
+            """
+            UPDATE workers SET delivery_status = ?, delivery_summary = ?, artifact_ref = ?,
+                result_available = ?, delivery_note = ?, delivery_updated_at = ?, updated_at = ?
+            WHERE collaboration_id = ? AND worker_id = ?
+            """,
+            (
+                new_status,
+                summary,
+                artifact_ref,
+                int(result_available),
+                getattr(args, "note", None),
+                timestamp,
+                timestamp,
+                args.collaboration_id,
+                args.worker_id,
+            ),
+        )
+        add_event(
+            connection,
+            args.collaboration_id,
+            version,
+            "delivery_status_changed",
+            "worker" if actor == "worker" else "leader",
+            {
+                "worker_id": args.worker_id,
+                "from": old_status,
+                "to": new_status,
+                "summary": summary,
+                "artifact_ref": artifact_ref,
+                "result_available": result_available,
+            },
+            args.idempotency_key,
+        )
+        result = snapshot(connection, args.collaboration_id)
+        result["delivery"] = {
+            "worker_id": args.worker_id,
+            "from": old_status,
+            "status": new_status,
+            "result_available": result_available,
+        }
+        return result
+
+
 def command_set_worker_status(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
     with immediate_transaction(connection):
         if replayed_event(connection, args.collaboration_id, args.idempotency_key):
@@ -572,6 +1147,15 @@ def command_set_worker_status(connection: sqlite3.Connection, args: argparse.Nam
         current = worker_row(connection, args.collaboration_id, args.worker_id)
         if current["status"] in TERMINAL_WORKER_STATUSES and current["status"] != args.status:
             raise StateError("A terminal Worker cannot be reopened")
+        if args.status == "completed":
+            if current["delivery_status"] not in {"submitted", "received", "accepted"}:
+                raise StateError(
+                    "A Worker cannot be completed before a delivery is submitted with a summary or result reference"
+                )
+            if not (current["delivery_summary"] or current["artifact_ref"]):
+                raise StateError(
+                    "A Worker cannot be completed without a delivery summary or result reference"
+                )
         version = bump_version(connection, args.collaboration_id, args.expected_version)
         connection.execute(
             """
@@ -590,6 +1174,298 @@ def command_set_worker_status(connection: sqlite3.Connection, args: argparse.Nam
             args.idempotency_key,
         )
         return snapshot(connection, args.collaboration_id)
+
+
+def parse_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError("expected yes/no or true/false")
+
+
+def validate_timestamp(value: str | None, field_name: str) -> str | None:
+    if value is None:
+        return None
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise StateError(f"Invalid {field_name} timestamp: {value}") from error
+    return value
+
+
+def timestamp_is_expired(lease_until: str | None, observed_at: str) -> bool:
+    if not lease_until:
+        return False
+    try:
+        lease_time = datetime.fromisoformat(lease_until.replace("Z", "+00:00"))
+        observed_time = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+        if lease_time.tzinfo is None:
+            lease_time = lease_time.replace(tzinfo=timezone.utc)
+        if observed_time.tzinfo is None:
+            observed_time = observed_time.replace(tzinfo=timezone.utc)
+        return lease_time < observed_time
+    except ValueError as error:
+        raise StateError("Lease and observation timestamps must be ISO-8601") from error
+
+
+def command_record_observation(
+    connection: sqlite3.Connection, args: argparse.Namespace
+) -> dict[str, Any]:
+    with immediate_transaction(connection):
+        if replayed_event(connection, args.collaboration_id, args.idempotency_key):
+            result = snapshot(connection, args.collaboration_id)
+            result["replayed"] = True
+            return result
+        worker = worker_row(connection, args.collaboration_id, args.worker_id)
+        observed_at = validate_timestamp(getattr(args, "observed_at", None), "observed-at") or now()
+        last_contact_at = validate_timestamp(
+            getattr(args, "last_contact_at", None), "last-contact-at"
+        ) or observed_at
+        lease_until = validate_timestamp(getattr(args, "lease_until", None), "lease-until")
+        expired = timestamp_is_expired(lease_until, observed_at)
+        explicit_attention = getattr(args, "needs_attention", None)
+        needs_attention = bool(explicit_attention) or not args.task_exists or expired or (
+            args.host_status == "completed" and not args.result_available
+        )
+        version = bump_version(connection, args.collaboration_id, args.expected_version)
+        timestamp = now()
+        connection.execute(
+            """
+            INSERT INTO host_observations (
+                collaboration_id, worker_id, observed_at, task_exists, host_status,
+                result_available, last_contact_at, lease_until, needs_attention,
+                note, source_ref, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(collaboration_id, worker_id) DO UPDATE SET
+                observed_at = excluded.observed_at,
+                task_exists = excluded.task_exists,
+                host_status = excluded.host_status,
+                result_available = excluded.result_available,
+                last_contact_at = excluded.last_contact_at,
+                lease_until = excluded.lease_until,
+                needs_attention = excluded.needs_attention,
+                note = excluded.note,
+                source_ref = excluded.source_ref,
+                updated_at = excluded.updated_at
+            """,
+            (
+                args.collaboration_id,
+                args.worker_id,
+                observed_at,
+                int(args.task_exists),
+                args.host_status,
+                int(args.result_available),
+                last_contact_at,
+                lease_until,
+                int(needs_attention),
+                getattr(args, "note", None),
+                getattr(args, "source_ref", None),
+                timestamp,
+            ),
+        )
+        if needs_attention and worker["delivery_status"] != "accepted":
+            connection.execute(
+                """
+                UPDATE workers SET delivery_status = 'needs_attention',
+                    delivery_note = ?, delivery_updated_at = ?, updated_at = ?
+                WHERE collaboration_id = ? AND worker_id = ?
+                  AND delivery_status != 'accepted'
+                """,
+                (
+                    getattr(args, "note", None) or "Host observation needs attention",
+                    timestamp,
+                    timestamp,
+                    args.collaboration_id,
+                    args.worker_id,
+                ),
+            )
+        add_event(
+            connection,
+            args.collaboration_id,
+            version,
+            "host_observed",
+            "leader",
+            {
+                "worker_id": args.worker_id,
+                "task_exists": args.task_exists,
+                "host_status": args.host_status,
+                "result_available": args.result_available,
+                "observed_at": observed_at,
+                "lease_until": lease_until,
+                "needs_attention": needs_attention,
+            },
+            args.idempotency_key,
+        )
+        result = snapshot(connection, args.collaboration_id)
+        result["host_observation"] = _host_observation(
+            connection, args.collaboration_id, args.worker_id
+        )
+        return result
+
+
+def command_record_failure(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
+    with immediate_transaction(connection):
+        if replayed_event(connection, args.collaboration_id, args.idempotency_key):
+            result = snapshot(connection, args.collaboration_id)
+            result["replayed"] = True
+            return result
+        worker_row(connection, args.collaboration_id, args.worker_id)
+        action = FAILURE_ACTIONS[args.category]
+        version = bump_version(connection, args.collaboration_id, args.expected_version)
+        created_at = now()
+        connection.execute(
+            """
+            INSERT INTO failures (
+                collaboration_id, worker_id, category, message, action_kind,
+                action_owner, automatic_retry, source_ref, created_at, idempotency_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                args.collaboration_id,
+                args.worker_id,
+                args.category,
+                args.message,
+                action["kind"],
+                action["owner"],
+                int(action["automatic"]),
+                getattr(args, "source_ref", None),
+                created_at,
+                args.idempotency_key,
+            ),
+        )
+        add_event(
+            connection,
+            args.collaboration_id,
+            version,
+            "failure_recorded",
+            "leader",
+            {
+                "worker_id": args.worker_id,
+                "category": args.category,
+                "message": args.message,
+                "action": action,
+            },
+            args.idempotency_key,
+        )
+        result = snapshot(connection, args.collaboration_id)
+        result["failure"] = {
+            "worker_id": args.worker_id,
+            "category": args.category,
+            "message": args.message,
+            **action,
+        }
+        return result
+
+
+def _pending_context(connection: sqlite3.Connection, collaboration_id: str, worker_id: str) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT cu.update_id, cu.version, cu.summary, cu.source_ref, cu.created_at
+        FROM context_updates AS cu
+        JOIN context_targets AS ct ON ct.update_id = cu.update_id
+        WHERE cu.collaboration_id = ? AND ct.worker_id = ? AND ct.delivered_at IS NULL
+        ORDER BY cu.version
+        """,
+        (collaboration_id, worker_id),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def resume_data(connection: sqlite3.Connection, collaboration_id: str) -> dict[str, Any]:
+    current = snapshot(connection, collaboration_id)
+    workers = []
+    unacknowledged_context: list[dict[str, Any]] = []
+    notes: list[str] = []
+    next_actions: list[dict[str, Any]] = []
+    for worker in current["workers"]:
+        pending = _pending_context(connection, collaboration_id, worker["worker_id"])
+        if pending:
+            unacknowledged_context.append(
+                {"worker_id": worker["worker_id"], "thread_id": worker["thread_id"], "updates": pending}
+            )
+            if worker["thread_id"]:
+                next_actions.append(
+                    {"kind": "deliver_context", "worker_id": worker["worker_id"], "thread_id": worker["thread_id"]}
+                )
+            else:
+                notes.append(f"Worker {worker['worker_id']} has pending context but no thread yet")
+        observation = worker["host_observation"]
+        creation_event = latest_worker_creation_event(
+            connection, collaboration_id, worker["worker_id"]
+        )
+        creation_state = "attached" if worker["thread_id"] else (
+            "uncertain"
+            if creation_event is not None and creation_event["event_type"] == "worker_creation_requested"
+            else "ready"
+        )
+        if worker["status"] == "planned" and not worker["thread_id"]:
+            if creation_state == "uncertain":
+                notes.append(
+                    f"Worker {worker['worker_id']} has an unresolved host creation request; reconcile before retrying"
+                )
+                next_actions.append({"kind": "reconcile_creation", "worker_id": worker["worker_id"]})
+            else:
+                next_actions.append({"kind": "create_worker", "worker_id": worker["worker_id"]})
+        elif observation is None and worker["thread_id"]:
+            notes.append(f"Worker {worker['worker_id']} has no host observation yet")
+            next_actions.append({"kind": "observe_worker", "worker_id": worker["worker_id"]})
+        if observation is not None:
+            if observation["needs_attention"]:
+                notes.append(f"Worker {worker['worker_id']} host observation needs attention")
+            if not observation["task_exists"]:
+                notes.append(f"Worker {worker['worker_id']} host task is missing")
+                next_actions.append({"kind": "reconcile_host_task", "worker_id": worker["worker_id"]})
+            if observation["lease_until"] and timestamp_is_expired(observation["lease_until"], now()):
+                notes.append(f"Worker {worker['worker_id']} lease is expired")
+                next_actions.append({"kind": "observe_worker", "worker_id": worker["worker_id"]})
+        if worker["delivery_status"] in {"submitted", "received"}:
+            next_actions.append({"kind": "review_delivery", "worker_id": worker["worker_id"]})
+        elif worker["delivery_status"] == "needs_attention":
+            notes.append(f"Worker {worker['worker_id']} needs a verifiable result before acceptance")
+            next_actions.append({"kind": "obtain_result", "worker_id": worker["worker_id"]})
+        if worker["latest_failure"] is not None and worker["latest_failure"]["resolved_at"] is None:
+            next_actions.append(
+                {
+                    "kind": worker["latest_failure"]["action_kind"],
+                    "worker_id": worker["worker_id"],
+                    "retryable": worker["latest_failure"]["retryable"],
+                    "automatic": worker["latest_failure"]["automatic_retry"],
+                }
+            )
+        workers.append(
+            {
+                "worker_id": worker["worker_id"],
+                "thread_id": worker["thread_id"],
+                "title": worker["title"],
+                "model": worker["model"],
+                "thinking": worker["thinking"],
+                "responsibility": worker["responsibility"],
+                "creation_state": creation_state,
+                "status": worker["status"],
+                "delivery_status": worker["delivery_status"],
+                "result_available": worker["result_available"],
+                "host_observation": observation,
+                "pending_context_count": len(pending),
+                "latest_failure": worker["latest_failure"],
+            }
+        )
+    return {
+        "collaboration_id": collaboration_id,
+        "objective": current["objective"],
+        "leader": {"thread_id": current["leader_thread_id"]},
+        "versions": {"skill": current.get("skill_version", SKILL_VERSION), "schema": STATE_SCHEMA_VERSION},
+        "status": current["status"],
+        "workers": workers,
+        "unacknowledged_context": unacknowledged_context,
+        "notes": list(dict.fromkeys(notes)),
+        "next_actions": next_actions,
+    }
+
+
+def command_resume(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
+    return resume_data(connection, args.collaboration_id)
 
 
 def command_events(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
@@ -622,6 +1498,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    migrate_parser = subparsers.add_parser("migrate", help="Run explicit SQLite schema migrations")
+    migrate_parser.set_defaults(handler=lambda connection, arguments: {"schema_version": migrate(connection)})
+
     init_parser = subparsers.add_parser("init", help="Create or resume a collaboration")
     init_parser.add_argument("--collaboration-id")
     init_parser.add_argument("--objective", required=True)
@@ -646,6 +1525,26 @@ def build_parser() -> argparse.ArgumentParser:
     attach_parser.add_argument("--thread-id", required=True)
     add_mutation_arguments(attach_parser)
     attach_parser.set_defaults(handler=command_attach_worker)
+
+    reconcile_creation_parser = subparsers.add_parser(
+        "reconcile-worker-creation", help="Resolve an uncertain host Worker creation before retrying"
+    )
+    reconcile_creation_parser.add_argument("--collaboration-id", required=True)
+    reconcile_creation_parser.add_argument("--worker-id", required=True)
+    reconcile_creation_parser.add_argument("--outcome", choices=("missing", "retry", "attached"), required=True)
+    reconcile_creation_parser.add_argument("--thread-id")
+    add_mutation_arguments(reconcile_creation_parser)
+    reconcile_creation_parser.set_defaults(handler=command_reconcile_worker_creation)
+
+    config_parser = subparsers.add_parser(
+        "update-worker-config", help="Version and record a Worker model/thinking update"
+    )
+    config_parser.add_argument("--collaboration-id", required=True)
+    config_parser.add_argument("--worker-id", required=True)
+    config_parser.add_argument("--model")
+    config_parser.add_argument("--thinking")
+    add_mutation_arguments(config_parser)
+    config_parser.set_defaults(handler=command_update_worker_config)
 
     context_parser = subparsers.add_parser(
         "add-context", help="Create a versioned context update for selected Workers"
@@ -690,11 +1589,57 @@ def build_parser() -> argparse.ArgumentParser:
     add_mutation_arguments(worker_status_parser)
     worker_status_parser.set_defaults(handler=command_set_worker_status)
 
+    delivery_parser = subparsers.add_parser(
+        "set-delivery-status", aliases=["set-delivery"], help="Advance the Worker delivery handshake"
+    )
+    delivery_parser.add_argument("--collaboration-id", required=True)
+    delivery_parser.add_argument("--worker-id", required=True)
+    delivery_parser.add_argument("--status", choices=DELIVERY_STATUSES, required=True)
+    delivery_parser.add_argument("--summary", "--result-summary", dest="summary")
+    delivery_parser.add_argument("--artifact-ref", "--result-ref", dest="artifact_ref")
+    delivery_parser.add_argument("--result-available", action="store_true")
+    delivery_parser.add_argument("--note")
+    delivery_parser.add_argument("--actor", choices=("leader", "worker"), default="leader")
+    add_mutation_arguments(delivery_parser)
+    delivery_parser.set_defaults(handler=command_set_delivery_status)
+
+    observation_parser = subparsers.add_parser(
+        "record-observation", aliases=["observe-worker", "observe"], help="Record an observation obtained from the host"
+    )
+    observation_parser.add_argument("--collaboration-id", required=True)
+    observation_parser.add_argument("--worker-id", required=True)
+    observation_parser.add_argument("--task-exists", type=parse_bool, required=True)
+    observation_parser.add_argument("--host-status", required=True)
+    observation_parser.add_argument("--result-available", type=parse_bool, required=True)
+    observation_parser.add_argument("--observed-at")
+    observation_parser.add_argument("--last-contact-at")
+    observation_parser.add_argument("--lease-until")
+    observation_parser.add_argument("--needs-attention", type=parse_bool)
+    observation_parser.add_argument("--note")
+    observation_parser.add_argument("--source-ref")
+    add_mutation_arguments(observation_parser)
+    observation_parser.set_defaults(handler=command_record_observation)
+
+    failure_parser = subparsers.add_parser(
+        "record-failure", help="Record a classified failure without deciding whether to retry"
+    )
+    failure_parser.add_argument("--collaboration-id", required=True)
+    failure_parser.add_argument("--worker-id", required=True)
+    failure_parser.add_argument("--category", choices=FAILURE_CATEGORIES, required=True)
+    failure_parser.add_argument("--message", required=True)
+    failure_parser.add_argument("--source-ref")
+    add_mutation_arguments(failure_parser)
+    failure_parser.set_defaults(handler=command_record_failure)
+
     snapshot_parser = subparsers.add_parser("snapshot", help="Return compact resumable state")
     snapshot_parser.add_argument("--collaboration-id", required=True)
     snapshot_parser.set_defaults(
         handler=lambda connection, arguments: snapshot(connection, arguments.collaboration_id)
     )
+
+    resume_parser = subparsers.add_parser("resume", help="Return a compact recovery summary and mechanical actions")
+    resume_parser.add_argument("--collaboration-id", required=True)
+    resume_parser.set_defaults(handler=command_resume)
 
     events_parser = subparsers.add_parser("events", help="Return recent durable events")
     events_parser.add_argument("--collaboration-id", required=True)
