@@ -1,0 +1,7 @@
+interface:
+  display_name: "可见协作"
+  short_description: "先确认能力匹配方案，再由可见 Worker 执行并完整交付"
+  default_prompt: "使用 $visible-team，先按任务内容和模型能力提出简洁分配方案供我确认；确认后协调可见 Worker，并完整交付我的原始请求。"
+
+policy:
+  allow_implicit_invocation: true
