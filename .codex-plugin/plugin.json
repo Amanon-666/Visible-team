@@ -1,0 +1,35 @@
+{
+  "name": "visible-team",
+  "version": "0.1.0",
+  "description": "Coordinate user-visible Codex Workers with confirmed allocation and lightweight durable collaboration state.",
+  "author": {
+    "name": "Amanon-666",
+    "email": "2061810891@qq.com",
+    "url": "https://github.com/Amanon-666"
+  },
+  "homepage": "https://github.com/Amanon-666/Visible-team",
+  "repository": "https://github.com/Amanon-666/Visible-team",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "multi-agent",
+    "orchestration",
+    "visible-workers"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "可见协作",
+    "shortDescription": "确认分工后协调可见 Worker，并保持任务连续性",
+    "longDescription": "让当前 Codex 任务保留高价值判断，把合适的执行工作交给用户可见、可直接控制的 Worker，并用轻量持久状态支持跨阶段恢复和定向上下文同步。",
+    "developerName": "Amanon-666",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "使用可见协作完成这个任务，先提出分工供我确认。",
+      "继续上一次可见协作，并复用合适的 Worker。"
+    ]
+  }
+}
