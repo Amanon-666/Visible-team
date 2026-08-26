@@ -1,0 +1,1 @@
+skills/visible-team/SKILL.md

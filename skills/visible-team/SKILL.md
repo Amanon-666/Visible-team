@@ -77,6 +77,12 @@ Use the host's normal project-task tools when available:
 
 If the required visible-task or independent-model capability is unavailable, explain the limitation. Do not pretend a hidden process or silent fallback is equivalent.
 
+## Use External Providers Only When Requested
+
+Do not allocate work to Antigravity, DeepSeek Harness, or another external application by default. Use one only when the user explicitly names it or accepts an allocation that names it. Before dispatch, confirm and retain the exact provider, model, reasoning setting, permission/sandbox mode, and responsibility; never silently substitute another configuration.
+
+For an approved external allocation, use the same collaboration state, targeted context, supervision, and delivery rules as Codex Workers. Preserve provider-native session/task IDs and native Token counters. Treat native session visibility, reopening, cancellation, and usage reporting as separate capabilities; report an unsupported or unverified capability honestly instead of simulating it. Read [references/external-providers.md](references/external-providers.md) for the bundled adapter and state contract.
+
 ## Coordinate Through Completion
 
 After dispatch, give a concise progress update without ending the task. When sustained coordination is requested, keep the Leader active: use `wait_threads` for bounded event waits, `read_thread` when detail is useful, and `send_message_to_thread` for answers, changed decisions, or corrections.

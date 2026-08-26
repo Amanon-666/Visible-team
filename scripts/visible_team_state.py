@@ -59,8 +59,10 @@ FAILURE_ACTIONS = {
     "authorization": {"kind": "authorize", "owner": "user_or_leader", "retryable": False, "automatic": False},
     "conflict": {"kind": "resolve_conflict", "owner": "leader", "retryable": False, "automatic": False},
 }
-STATE_SCHEMA_VERSION = 2
-SKILL_VERSION = "visible-team/2"
+PROVIDERS = ("codex", "antigravity", "deepseek-harness")
+EXTERNAL_PROVIDERS = {"antigravity", "deepseek-harness"}
+STATE_SCHEMA_VERSION = 3
+SKILL_VERSION = "visible-team/3"
 
 
 class StateError(RuntimeError):
@@ -95,7 +97,7 @@ def _table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
     )
 
 
-def _validate_v2_schema(connection: sqlite3.Connection) -> None:
+def _validate_v3_schema(connection: sqlite3.Connection) -> None:
     required_tables = (
         "collaborations",
         "workers",
@@ -104,10 +106,11 @@ def _validate_v2_schema(connection: sqlite3.Connection) -> None:
         "events",
         "host_observations",
         "failures",
+        "worker_usage",
     )
     missing = [table for table in required_tables if not _table_exists(connection, table)]
     if missing:
-        raise StateError(f"Database schema 2 is incomplete; missing tables: {', '.join(missing)}")
+        raise StateError(f"Database schema 3 is incomplete; missing tables: {', '.join(missing)}")
     required_columns = {
         "collaborations": (
             "collaboration_id",
@@ -137,6 +140,13 @@ def _validate_v2_schema(connection: sqlite3.Connection) -> None:
             "result_available",
             "delivery_note",
             "delivery_updated_at",
+            "provider",
+            "permission_mode",
+            "dispatch_authorized",
+            "authorization_note",
+            "authorized_at",
+            "native_task_id",
+            "native_open_ref",
         ),
         "context_updates": (
             "update_id",
@@ -186,6 +196,23 @@ def _validate_v2_schema(connection: sqlite3.Connection) -> None:
             "idempotency_key",
             "resolved_at",
         ),
+        "worker_usage": (
+            "usage_id",
+            "collaboration_id",
+            "worker_id",
+            "provider",
+            "native_task_id",
+            "source",
+            "observed_at",
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+            "total_tokens",
+            "cumulative",
+            "raw_json",
+            "idempotency_key",
+        ),
     }
     missing_columns = [
         f"{table}.{column}"
@@ -195,7 +222,7 @@ def _validate_v2_schema(connection: sqlite3.Connection) -> None:
     ]
     if missing_columns:
         raise StateError(
-            f"Database schema 2 is incomplete; missing columns: {', '.join(missing_columns)}"
+            f"Database schema 3 is incomplete; missing columns: {', '.join(missing_columns)}"
         )
 
 
@@ -356,6 +383,102 @@ def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
         connection.execute(statement)
 
 
+def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+    """Add provider-neutral identities, explicit external authorization, and usage."""
+    worker_columns = (
+        ("provider", "TEXT NOT NULL DEFAULT 'codex'"),
+        ("permission_mode", "TEXT NOT NULL DEFAULT 'host-default'"),
+        ("dispatch_authorized", "INTEGER NOT NULL DEFAULT 1"),
+        ("authorization_note", "TEXT"),
+        ("authorized_at", "TEXT"),
+        ("native_task_id", "TEXT"),
+        ("native_open_ref", "TEXT"),
+    )
+    for column_name, definition in worker_columns:
+        if not _column_exists(connection, "workers", column_name):
+            connection.execute(f"ALTER TABLE workers ADD COLUMN {column_name} {definition}")
+    connection.execute(
+        "UPDATE workers SET native_task_id = thread_id "
+        "WHERE provider = 'codex' AND native_task_id IS NULL AND thread_id IS NOT NULL"
+    )
+    connection.execute(
+        "UPDATE collaborations SET skill_version = 'visible-team/3' "
+        "WHERE skill_version IS NULL OR skill_version != 'visible-team/3'"
+    )
+    statements = (
+        """
+        CREATE TABLE IF NOT EXISTS worker_usage (
+            usage_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            collaboration_id TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            native_task_id TEXT,
+            source TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            input_tokens INTEGER,
+            cached_input_tokens INTEGER,
+            output_tokens INTEGER,
+            reasoning_output_tokens INTEGER,
+            total_tokens INTEGER,
+            cumulative INTEGER NOT NULL DEFAULT 1,
+            raw_json TEXT,
+            idempotency_key TEXT NOT NULL,
+            UNIQUE (collaboration_id, idempotency_key),
+            FOREIGN KEY (collaboration_id, worker_id)
+                REFERENCES workers(collaboration_id, worker_id)
+                ON DELETE CASCADE
+        );
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS worker_usage_latest_idx
+            ON worker_usage(collaboration_id, worker_id, usage_id);
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS workers_native_task_idx
+            ON workers(collaboration_id, provider, native_task_id)
+            WHERE native_task_id IS NOT NULL;
+        """,
+    )
+    for statement in statements:
+        connection.execute(statement)
+
+
+def _validate_v2_for_migration(connection: sqlite3.Connection) -> None:
+    required_tables = (
+        "collaborations",
+        "workers",
+        "context_updates",
+        "context_targets",
+        "events",
+        "host_observations",
+        "failures",
+    )
+    missing = [table for table in required_tables if not _table_exists(connection, table)]
+    if missing:
+        raise StateError(f"Database schema 2 is incomplete; missing tables: {', '.join(missing)}")
+    required_columns = {
+        "collaborations": ("collaboration_id", "skill_version"),
+        "workers": (
+            "collaboration_id",
+            "worker_id",
+            "thread_id",
+            "model",
+            "thinking",
+            "delivery_status",
+        ),
+    }
+    missing_columns = [
+        f"{table}.{column}"
+        for table, columns in required_columns.items()
+        for column in columns
+        if not _column_exists(connection, table, column)
+    ]
+    if missing_columns:
+        raise StateError(
+            f"Database schema 2 is incomplete; missing columns: {', '.join(missing_columns)}"
+        )
+
+
 def migrate(connection: sqlite3.Connection) -> int:
     """Run explicit, monotonic schema migrations and return the schema version."""
     with immediate_transaction(connection):
@@ -372,11 +495,16 @@ def migrate(connection: sqlite3.Connection) -> int:
             _migrate_v1_to_v2(connection)
             connection.execute("PRAGMA user_version = 2")
             version = 2
+        if version == 2:
+            _validate_v2_for_migration(connection)
+            _migrate_v2_to_v3(connection)
+            connection.execute("PRAGMA user_version = 3")
+            version = 3
         if version > STATE_SCHEMA_VERSION:
             raise StateError(
                 f"Database schema {version} is newer than supported schema {STATE_SCHEMA_VERSION}"
             )
-        _validate_v2_schema(connection)
+        _validate_v3_schema(connection)
     return version
 
 
@@ -521,6 +649,36 @@ def _latest_failure(connection: sqlite3.Connection, collaboration_id: str, worke
     return item
 
 
+def _latest_usage(
+    connection: sqlite3.Connection, collaboration_id: str, worker_id: str
+) -> dict[str, Any] | None:
+    row = connection.execute(
+        """
+        SELECT usage_id, provider, native_task_id, source, observed_at,
+               input_tokens, cached_input_tokens, output_tokens,
+               reasoning_output_tokens, total_tokens, cumulative, raw_json
+        FROM worker_usage
+        WHERE collaboration_id = ? AND worker_id = ?
+        ORDER BY usage_id DESC LIMIT 1
+        """,
+        (collaboration_id, worker_id),
+    ).fetchone()
+    if row is None:
+        return None
+    item = dict(row)
+    item["cumulative"] = _bool_value(item["cumulative"])
+    if item["raw_json"]:
+        try:
+            item["raw"] = json.loads(item.pop("raw_json"))
+        except json.JSONDecodeError:
+            item["raw"] = None
+            item.pop("raw_json", None)
+    else:
+        item.pop("raw_json", None)
+        item["raw"] = None
+    return item
+
+
 def snapshot(connection: sqlite3.Connection, collaboration_id: str) -> dict[str, Any]:
     collaboration = dict(collaboration_row(connection, collaboration_id))
     collaboration["schema_version"] = STATE_SCHEMA_VERSION
@@ -548,10 +706,14 @@ def snapshot(connection: sqlite3.Connection, collaboration_id: str) -> dict[str,
         item = dict(row)
         item["pending_updates"] = int(item["pending_updates"] or 0)
         item["result_available"] = _bool_value(item["result_available"])
+        item["dispatch_authorized"] = _bool_value(item["dispatch_authorized"])
         item["host_observation"] = _host_observation(
             connection, collaboration_id, item["worker_id"]
         )
         item["latest_failure"] = _latest_failure(
+            connection, collaboration_id, item["worker_id"]
+        )
+        item["latest_usage"] = _latest_usage(
             connection, collaboration_id, item["worker_id"]
         )
         workers.append(item)
@@ -614,14 +776,22 @@ def command_plan_worker(connection: sqlite3.Connection, args: argparse.Namespace
             raise StateError(
                 "Worker already exists; retry with the original idempotency key or choose a new Worker ID"
             )
+        provider = getattr(args, "provider", "codex")
+        if provider not in PROVIDERS:
+            raise StateError(f"Unsupported provider: {provider}")
+        permission_mode = getattr(args, "permission_mode", None) or (
+            "host-default" if provider == "codex" else "safe"
+        )
+        dispatch_authorized = provider == "codex"
         version = bump_version(connection, args.collaboration_id, args.expected_version)
         timestamp = now()
         connection.execute(
             """
             INSERT INTO workers (
                 collaboration_id, worker_id, thread_id, title, model, thinking,
-                responsibility, status, last_context_version, created_at, updated_at
-            ) VALUES (?, ?, NULL, ?, ?, ?, ?, 'planned', 0, ?, ?)
+                responsibility, status, last_context_version, created_at, updated_at,
+                provider, permission_mode, dispatch_authorized
+            ) VALUES (?, ?, NULL, ?, ?, ?, ?, 'planned', 0, ?, ?, ?, ?, ?)
             """,
             (
                 args.collaboration_id,
@@ -632,6 +802,9 @@ def command_plan_worker(connection: sqlite3.Connection, args: argparse.Namespace
                 args.responsibility,
                 timestamp,
                 timestamp,
+                provider,
+                permission_mode,
+                int(dispatch_authorized),
             ),
         )
         add_event(
@@ -646,6 +819,63 @@ def command_plan_worker(connection: sqlite3.Connection, args: argparse.Namespace
                 "model": args.model,
                 "thinking": args.thinking,
                 "responsibility": args.responsibility,
+                "provider": provider,
+                "permission_mode": permission_mode,
+                "dispatch_authorized": dispatch_authorized,
+            },
+            args.idempotency_key,
+        )
+        return snapshot(connection, args.collaboration_id)
+
+
+def command_authorize_worker(
+    connection: sqlite3.Connection, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Record the user's explicit approval for one exact external allocation."""
+    with immediate_transaction(connection):
+        if replayed_event(connection, args.collaboration_id, args.idempotency_key):
+            result = snapshot(connection, args.collaboration_id)
+            result["replayed"] = True
+            return result
+        worker = worker_row(connection, args.collaboration_id, args.worker_id)
+        if worker["provider"] not in EXTERNAL_PROVIDERS:
+            raise StateError("Codex Workers do not require external dispatch authorization")
+        if worker["status"] != "planned" or worker["native_task_id"] is not None:
+            raise StateError("Only an unstarted external Worker can be authorized")
+        if not args.approval_note.strip():
+            raise StateError("External dispatch authorization requires a non-empty approval note")
+        if worker["dispatch_authorized"]:
+            raise StateError("External Worker is already authorized; reuse the original key")
+        version = bump_version(connection, args.collaboration_id, args.expected_version)
+        timestamp = now()
+        connection.execute(
+            """
+            UPDATE workers
+            SET dispatch_authorized = 1, authorization_note = ?, authorized_at = ?,
+                updated_at = ?
+            WHERE collaboration_id = ? AND worker_id = ?
+            """,
+            (
+                args.approval_note,
+                timestamp,
+                timestamp,
+                args.collaboration_id,
+                args.worker_id,
+            ),
+        )
+        add_event(
+            connection,
+            args.collaboration_id,
+            version,
+            "external_dispatch_authorized",
+            "user",
+            {
+                "worker_id": args.worker_id,
+                "provider": worker["provider"],
+                "model": worker["model"],
+                "thinking": worker["thinking"],
+                "permission_mode": worker["permission_mode"],
+                "approval_note": args.approval_note,
             },
             args.idempotency_key,
         )
@@ -659,6 +889,8 @@ def command_attach_worker(connection: sqlite3.Connection, args: argparse.Namespa
             result["replayed"] = True
             return result
         worker = worker_row(connection, args.collaboration_id, args.worker_id)
+        if worker["provider"] != "codex":
+            raise StateError("Use attach-provider-worker for a non-Codex Worker")
         if worker["thread_id"] is not None:
             if worker["thread_id"] == args.thread_id:
                 result = snapshot(connection, args.collaboration_id)
@@ -673,10 +905,16 @@ def command_attach_worker(connection: sqlite3.Connection, args: argparse.Namespa
             connection.execute(
                 """
                 UPDATE workers
-                SET thread_id = ?, status = 'active', updated_at = ?
+                SET thread_id = ?, native_task_id = ?, status = 'active', updated_at = ?
                 WHERE collaboration_id = ? AND worker_id = ?
                 """,
-                (args.thread_id, timestamp, args.collaboration_id, args.worker_id),
+                (
+                    args.thread_id,
+                    args.thread_id,
+                    timestamp,
+                    args.collaboration_id,
+                    args.worker_id,
+                ),
             )
         except sqlite3.IntegrityError as error:
             raise StateError("That visible thread is already attached to another Worker") from error
@@ -687,6 +925,65 @@ def command_attach_worker(connection: sqlite3.Connection, args: argparse.Namespa
             "worker_attached",
             "leader",
             {"worker_id": args.worker_id, "thread_id": args.thread_id},
+            args.idempotency_key,
+        )
+        return snapshot(connection, args.collaboration_id)
+
+
+def command_attach_provider_worker(
+    connection: sqlite3.Connection, args: argparse.Namespace
+) -> dict[str, Any]:
+    """Bind a verified external native session/task without inventing Codex IDs."""
+    with immediate_transaction(connection):
+        if replayed_event(connection, args.collaboration_id, args.idempotency_key):
+            result = snapshot(connection, args.collaboration_id)
+            result["replayed"] = True
+            return result
+        worker = worker_row(connection, args.collaboration_id, args.worker_id)
+        if worker["provider"] not in EXTERNAL_PROVIDERS:
+            raise StateError("Use attach-worker for a Codex Worker")
+        if not worker["dispatch_authorized"]:
+            raise StateError("External Worker cannot attach before explicit dispatch authorization")
+        if worker["native_task_id"] is not None:
+            if (
+                worker["native_task_id"] == args.native_task_id
+                and worker["native_open_ref"] == args.native_open_ref
+            ):
+                result = snapshot(connection, args.collaboration_id)
+                result["reconciled"] = True
+                return result
+            raise StateError("External Worker is already attached to a different native task")
+        version = bump_version(connection, args.collaboration_id, args.expected_version)
+        timestamp = now()
+        try:
+            connection.execute(
+                """
+                UPDATE workers
+                SET native_task_id = ?, native_open_ref = ?, status = 'active', updated_at = ?
+                WHERE collaboration_id = ? AND worker_id = ?
+                """,
+                (
+                    args.native_task_id,
+                    args.native_open_ref,
+                    timestamp,
+                    args.collaboration_id,
+                    args.worker_id,
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise StateError("That native task is already attached to another Worker") from error
+        add_event(
+            connection,
+            args.collaboration_id,
+            version,
+            "provider_worker_attached",
+            "leader",
+            {
+                "worker_id": args.worker_id,
+                "provider": worker["provider"],
+                "native_task_id": args.native_task_id,
+                "native_open_ref": args.native_open_ref,
+            },
             args.idempotency_key,
         )
         return snapshot(connection, args.collaboration_id)
@@ -728,9 +1025,11 @@ def command_reserve_host_action(
         action = args.action
         if action == "create_worker":
             if worker["status"] != "planned":
-                raise StateError("Only a planned Worker without a thread can be created")
-            if worker["thread_id"] is not None:
+                raise StateError("Only a planned Worker without a native task can be created")
+            if worker["native_task_id"] is not None:
                 return {"reserved": False, "reason": "already_attached"}
+            if worker["provider"] in EXTERNAL_PROVIDERS and not worker["dispatch_authorized"]:
+                raise StateError("External Worker dispatch has not been explicitly authorized")
             latest = latest_worker_creation_event(
                 connection, args.collaboration_id, args.worker_id
             )
@@ -750,6 +1049,8 @@ def command_reserve_host_action(
                 "action": action,
                 "worker_id": args.worker_id,
                 "thread_id": worker["thread_id"],
+                "provider": worker["provider"],
+                "native_task_id": worker["native_task_id"],
             },
             args.idempotency_key,
         )
@@ -767,35 +1068,74 @@ def command_reconcile_worker_creation(
         worker = worker_row(connection, args.collaboration_id, args.worker_id)
         if args.outcome not in {"missing", "retry", "attached"}:
             raise StateError("Creation reconciliation outcome must be missing, retry, or attached")
-        if worker["status"] != "planned" and worker["thread_id"] is None:
-            raise StateError("Only a planned Worker without a thread can reconcile creation")
+        if worker["status"] != "planned" and worker["native_task_id"] is None:
+            raise StateError("Only a planned Worker without a native task can reconcile creation")
         if args.outcome == "attached":
-            if not args.thread_id:
-                raise StateError("An attached reconciliation requires --thread-id")
-            if worker["thread_id"] is not None and worker["thread_id"] != args.thread_id:
-                raise StateError("Worker is already attached to a different visible thread")
-        elif worker["thread_id"] is not None:
+            if worker["provider"] == "codex":
+                if not args.thread_id:
+                    raise StateError("A Codex attached reconciliation requires --thread-id")
+                if worker["thread_id"] is not None and worker["thread_id"] != args.thread_id:
+                    raise StateError("Worker is already attached to a different visible thread")
+            else:
+                if not getattr(args, "native_task_id", None):
+                    raise StateError("An external attached reconciliation requires --native-task-id")
+                if worker["native_task_id"] is not None and worker["native_task_id"] != args.native_task_id:
+                    raise StateError("Worker is already attached to a different native task")
+        elif worker["native_task_id"] is not None:
             raise StateError("An attached Worker cannot be reconciled as missing or retry")
         version = bump_version(connection, args.collaboration_id, args.expected_version)
         timestamp = now()
-        if args.outcome == "attached" and worker["thread_id"] is None:
+        native_task_id = getattr(args, "native_task_id", None)
+        native_open_ref = getattr(args, "native_open_ref", None)
+        if args.outcome == "attached" and worker["native_task_id"] is None:
             try:
-                connection.execute(
-                    """
-                    UPDATE workers SET thread_id = ?, status = 'active', updated_at = ?
-                    WHERE collaboration_id = ? AND worker_id = ?
-                    """,
-                    (args.thread_id, timestamp, args.collaboration_id, args.worker_id),
-                )
+                if worker["provider"] == "codex":
+                    connection.execute(
+                        """
+                        UPDATE workers
+                        SET thread_id = ?, native_task_id = ?, status = 'active', updated_at = ?
+                        WHERE collaboration_id = ? AND worker_id = ?
+                        """,
+                        (
+                            args.thread_id,
+                            args.thread_id,
+                            timestamp,
+                            args.collaboration_id,
+                            args.worker_id,
+                        ),
+                    )
+                    native_task_id = args.thread_id
+                else:
+                    connection.execute(
+                        """
+                        UPDATE workers
+                        SET native_task_id = ?, native_open_ref = ?, status = 'active', updated_at = ?
+                        WHERE collaboration_id = ? AND worker_id = ?
+                        """,
+                        (
+                            native_task_id,
+                            native_open_ref,
+                            timestamp,
+                            args.collaboration_id,
+                            args.worker_id,
+                        ),
+                    )
             except sqlite3.IntegrityError as error:
-                raise StateError("That visible thread is already attached to another Worker") from error
+                raise StateError("That native task is already attached to another Worker") from error
             add_event(
                 connection,
                 args.collaboration_id,
                 version,
                 "worker_attached",
                 "leader",
-                {"worker_id": args.worker_id, "thread_id": args.thread_id, "reconciled": True},
+                {
+                    "worker_id": args.worker_id,
+                    "provider": worker["provider"],
+                    "thread_id": args.thread_id,
+                    "native_task_id": native_task_id,
+                    "native_open_ref": native_open_ref,
+                    "reconciled": True,
+                },
                 f"{args.idempotency_key}:attached",
             )
         add_event(
@@ -808,6 +1148,8 @@ def command_reconcile_worker_creation(
                 "worker_id": args.worker_id,
                 "outcome": args.outcome,
                 "thread_id": args.thread_id,
+                "native_task_id": native_task_id,
+                "native_open_ref": native_open_ref,
             },
             args.idempotency_key,
         )
@@ -816,6 +1158,8 @@ def command_reconcile_worker_creation(
             "worker_id": args.worker_id,
             "outcome": args.outcome,
             "thread_id": args.thread_id,
+            "native_task_id": native_task_id,
+            "native_open_ref": native_open_ref,
         }
         return result
 
@@ -834,23 +1178,60 @@ def command_update_worker_config(
         current = worker_row(connection, args.collaboration_id, args.worker_id)
         if current["status"] in TERMINAL_WORKER_STATUSES:
             raise StateError("A terminal Worker cannot have its model or thinking updated")
+        if current["provider"] in EXTERNAL_PROVIDERS and current["native_task_id"] is not None:
+            raise StateError(
+                "An attached external Worker cannot silently change model or thinking; plan a new allocation"
+            )
         if args.model is not None and not args.model.strip():
             raise StateError("Worker model cannot be empty")
         if args.thinking is not None and not args.thinking.strip():
             raise StateError("Worker thinking cannot be empty")
+        permission_arg = getattr(args, "permission_mode", None)
+        if permission_arg is not None and not permission_arg.strip():
+            raise StateError("Worker permission mode cannot be empty")
         model = args.model if args.model is not None else current["model"]
         thinking = args.thinking if args.thinking is not None else current["thinking"]
-        if model == current["model"] and thinking == current["thinking"]:
-            raise StateError("Worker config update must change model or thinking")
+        permission_mode = permission_arg if permission_arg is not None else current["permission_mode"]
+        if (
+            model == current["model"]
+            and thinking == current["thinking"]
+            and permission_mode == current["permission_mode"]
+        ):
+            raise StateError("Worker config update must change model, thinking, or permission mode")
         version = bump_version(connection, args.collaboration_id, args.expected_version)
         timestamp = now()
-        connection.execute(
-            """
-            UPDATE workers SET model = ?, thinking = ?, updated_at = ?
-            WHERE collaboration_id = ? AND worker_id = ?
-            """,
-            (model, thinking, timestamp, args.collaboration_id, args.worker_id),
-        )
+        if current["provider"] in EXTERNAL_PROVIDERS:
+            connection.execute(
+                """
+                UPDATE workers
+                SET model = ?, thinking = ?, permission_mode = ?, dispatch_authorized = 0,
+                    authorization_note = NULL, authorized_at = NULL, updated_at = ?
+                WHERE collaboration_id = ? AND worker_id = ?
+                """,
+                (
+                    model,
+                    thinking,
+                    permission_mode,
+                    timestamp,
+                    args.collaboration_id,
+                    args.worker_id,
+                ),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE workers SET model = ?, thinking = ?, permission_mode = ?, updated_at = ?
+                WHERE collaboration_id = ? AND worker_id = ?
+                """,
+                (
+                    model,
+                    thinking,
+                    permission_mode,
+                    timestamp,
+                    args.collaboration_id,
+                    args.worker_id,
+                ),
+            )
         add_event(
             connection,
             args.collaboration_id,
@@ -859,8 +1240,19 @@ def command_update_worker_config(
             "leader",
             {
                 "worker_id": args.worker_id,
-                "from": {"model": current["model"], "thinking": current["thinking"]},
-                "to": {"model": model, "thinking": thinking},
+                "from": {
+                    "model": current["model"],
+                    "thinking": current["thinking"],
+                    "permission_mode": current["permission_mode"],
+                },
+                "to": {
+                    "model": model,
+                    "thinking": thinking,
+                    "permission_mode": permission_mode,
+                },
+                "external_dispatch_reauthorization_required": (
+                    current["provider"] in EXTERNAL_PROVIDERS
+                ),
             },
             args.idempotency_key,
         )
@@ -869,6 +1261,7 @@ def command_update_worker_config(
             "worker_id": args.worker_id,
             "model": model,
             "thinking": thinking,
+            "permission_mode": permission_mode,
             "version": version,
         }
         return result
@@ -1359,6 +1752,87 @@ def command_record_failure(connection: sqlite3.Connection, args: argparse.Namesp
         return result
 
 
+def command_record_usage(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
+    """Persist one provider-native usage observation without estimating missing fields."""
+    fields = (
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "total_tokens",
+    )
+    values = {field: getattr(args, field, None) for field in fields}
+    if all(value is None for value in values.values()):
+        raise StateError("At least one native token counter is required")
+    if any(value is not None and value < 0 for value in values.values()):
+        raise StateError("Token counters must be non-negative")
+    observed_at = validate_timestamp(getattr(args, "observed_at", None), "observed_at") or now()
+    raw_json = getattr(args, "raw_json", None)
+    if raw_json is not None:
+        try:
+            parsed = json.loads(raw_json)
+        except json.JSONDecodeError as error:
+            raise StateError("raw_json must be valid JSON") from error
+        raw_json = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    with immediate_transaction(connection):
+        if replayed_event(connection, args.collaboration_id, args.idempotency_key):
+            result = snapshot(connection, args.collaboration_id)
+            result["replayed"] = True
+            return result
+        worker = worker_row(connection, args.collaboration_id, args.worker_id)
+        if worker["native_task_id"] is None:
+            raise StateError("Cannot record usage before a native task is attached")
+        version = bump_version(connection, args.collaboration_id, args.expected_version)
+        connection.execute(
+            """
+            INSERT INTO worker_usage (
+                collaboration_id, worker_id, provider, native_task_id, source,
+                observed_at, input_tokens, cached_input_tokens, output_tokens,
+                reasoning_output_tokens, total_tokens, cumulative, raw_json,
+                idempotency_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                args.collaboration_id,
+                args.worker_id,
+                worker["provider"],
+                worker["native_task_id"],
+                args.source,
+                observed_at,
+                values["input_tokens"],
+                values["cached_input_tokens"],
+                values["output_tokens"],
+                values["reasoning_output_tokens"],
+                values["total_tokens"],
+                int(getattr(args, "cumulative", True)),
+                raw_json,
+                args.idempotency_key,
+            ),
+        )
+        add_event(
+            connection,
+            args.collaboration_id,
+            version,
+            "worker_usage_recorded",
+            "host",
+            {
+                "worker_id": args.worker_id,
+                "provider": worker["provider"],
+                "native_task_id": worker["native_task_id"],
+                "source": args.source,
+                "observed_at": observed_at,
+                "cumulative": bool(getattr(args, "cumulative", True)),
+                **values,
+            },
+            args.idempotency_key,
+        )
+        result = snapshot(connection, args.collaboration_id)
+        result["usage_recorded"] = result["workers"][[
+            item["worker_id"] for item in result["workers"]
+        ].index(args.worker_id)]["latest_usage"]
+        return result
+
+
 def _pending_context(connection: sqlite3.Connection, collaboration_id: str, worker_id: str) -> list[dict[str, Any]]:
     rows = connection.execute(
         """
@@ -1380,35 +1854,61 @@ def resume_data(connection: sqlite3.Connection, collaboration_id: str) -> dict[s
     notes: list[str] = []
     next_actions: list[dict[str, Any]] = []
     for worker in current["workers"]:
+        native_task_id = worker["native_task_id"]
         pending = _pending_context(connection, collaboration_id, worker["worker_id"])
         if pending:
             unacknowledged_context.append(
-                {"worker_id": worker["worker_id"], "thread_id": worker["thread_id"], "updates": pending}
+                {
+                    "worker_id": worker["worker_id"],
+                    "provider": worker["provider"],
+                    "thread_id": worker["thread_id"],
+                    "native_task_id": native_task_id,
+                    "updates": pending,
+                }
             )
-            if worker["thread_id"]:
+            if native_task_id:
                 next_actions.append(
-                    {"kind": "deliver_context", "worker_id": worker["worker_id"], "thread_id": worker["thread_id"]}
+                    {
+                        "kind": "deliver_context",
+                        "worker_id": worker["worker_id"],
+                        "provider": worker["provider"],
+                        "native_task_id": native_task_id,
+                    }
                 )
             else:
-                notes.append(f"Worker {worker['worker_id']} has pending context but no thread yet")
+                notes.append(
+                    f"Worker {worker['worker_id']} has pending context but no thread/native task yet"
+                )
         observation = worker["host_observation"]
         creation_event = latest_worker_creation_event(
             connection, collaboration_id, worker["worker_id"]
         )
-        creation_state = "attached" if worker["thread_id"] else (
+        creation_state = "attached" if native_task_id else (
             "uncertain"
             if creation_event is not None and creation_event["event_type"] == "worker_creation_requested"
             else "ready"
         )
-        if worker["status"] == "planned" and not worker["thread_id"]:
-            if creation_state == "uncertain":
+        if worker["status"] == "planned" and not native_task_id:
+            if worker["provider"] in EXTERNAL_PROVIDERS and not worker["dispatch_authorized"]:
+                creation_state = "awaiting_authorization"
+                notes.append(
+                    f"Worker {worker['worker_id']} external dispatch requires explicit user authorization"
+                )
+                next_actions.append(
+                    {
+                        "kind": "request_dispatch_authorization",
+                        "worker_id": worker["worker_id"],
+                        "provider": worker["provider"],
+                    }
+                )
+            elif creation_state == "uncertain":
                 notes.append(
                     f"Worker {worker['worker_id']} has an unresolved host creation request; reconcile before retrying"
                 )
                 next_actions.append({"kind": "reconcile_creation", "worker_id": worker["worker_id"]})
             else:
                 next_actions.append({"kind": "create_worker", "worker_id": worker["worker_id"]})
-        elif observation is None and worker["thread_id"]:
+        elif observation is None and native_task_id:
             notes.append(f"Worker {worker['worker_id']} has no host observation yet")
             next_actions.append({"kind": "observe_worker", "worker_id": worker["worker_id"]})
         if observation is not None:
@@ -1437,10 +1937,16 @@ def resume_data(connection: sqlite3.Connection, collaboration_id: str) -> dict[s
         workers.append(
             {
                 "worker_id": worker["worker_id"],
+                "provider": worker["provider"],
                 "thread_id": worker["thread_id"],
+                "native_task_id": native_task_id,
+                "native_open_ref": worker["native_open_ref"],
                 "title": worker["title"],
                 "model": worker["model"],
                 "thinking": worker["thinking"],
+                "permission_mode": worker["permission_mode"],
+                "dispatch_authorized": worker["dispatch_authorized"],
+                "authorization_note": worker["authorization_note"],
                 "responsibility": worker["responsibility"],
                 "creation_state": creation_state,
                 "status": worker["status"],
@@ -1449,6 +1955,7 @@ def resume_data(connection: sqlite3.Connection, collaboration_id: str) -> dict[s
                 "host_observation": observation,
                 "pending_context_count": len(pending),
                 "latest_failure": worker["latest_failure"],
+                "latest_usage": worker["latest_usage"],
             }
         )
     return {
@@ -1514,8 +2021,22 @@ def build_parser() -> argparse.ArgumentParser:
     plan_parser.add_argument("--model", required=True)
     plan_parser.add_argument("--thinking", required=True)
     plan_parser.add_argument("--responsibility", required=True)
+    plan_parser.add_argument("--provider", choices=PROVIDERS, default="codex")
+    plan_parser.add_argument(
+        "--permission-mode",
+        help="Exact host permission/sandbox policy; external providers default to safe",
+    )
     add_mutation_arguments(plan_parser)
     plan_parser.set_defaults(handler=command_plan_worker)
+
+    authorize_parser = subparsers.add_parser(
+        "authorize-worker", help="Authorize one exact external provider/model/thinking allocation"
+    )
+    authorize_parser.add_argument("--collaboration-id", required=True)
+    authorize_parser.add_argument("--worker-id", required=True)
+    authorize_parser.add_argument("--approval-note", required=True)
+    add_mutation_arguments(authorize_parser)
+    authorize_parser.set_defaults(handler=command_authorize_worker)
 
     attach_parser = subparsers.add_parser(
         "attach-worker", help="Attach a visible thread to a planned Worker"
@@ -1526,6 +2047,16 @@ def build_parser() -> argparse.ArgumentParser:
     add_mutation_arguments(attach_parser)
     attach_parser.set_defaults(handler=command_attach_worker)
 
+    attach_provider_parser = subparsers.add_parser(
+        "attach-provider-worker", help="Attach an external provider's verified native task/session"
+    )
+    attach_provider_parser.add_argument("--collaboration-id", required=True)
+    attach_provider_parser.add_argument("--worker-id", required=True)
+    attach_provider_parser.add_argument("--native-task-id", required=True)
+    attach_provider_parser.add_argument("--native-open-ref")
+    add_mutation_arguments(attach_provider_parser)
+    attach_provider_parser.set_defaults(handler=command_attach_provider_worker)
+
     reconcile_creation_parser = subparsers.add_parser(
         "reconcile-worker-creation", help="Resolve an uncertain host Worker creation before retrying"
     )
@@ -1533,6 +2064,8 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile_creation_parser.add_argument("--worker-id", required=True)
     reconcile_creation_parser.add_argument("--outcome", choices=("missing", "retry", "attached"), required=True)
     reconcile_creation_parser.add_argument("--thread-id")
+    reconcile_creation_parser.add_argument("--native-task-id")
+    reconcile_creation_parser.add_argument("--native-open-ref")
     add_mutation_arguments(reconcile_creation_parser)
     reconcile_creation_parser.set_defaults(handler=command_reconcile_worker_creation)
 
@@ -1543,6 +2076,7 @@ def build_parser() -> argparse.ArgumentParser:
     config_parser.add_argument("--worker-id", required=True)
     config_parser.add_argument("--model")
     config_parser.add_argument("--thinking")
+    config_parser.add_argument("--permission-mode")
     add_mutation_arguments(config_parser)
     config_parser.set_defaults(handler=command_update_worker_config)
 
@@ -1630,6 +2164,23 @@ def build_parser() -> argparse.ArgumentParser:
     failure_parser.add_argument("--source-ref")
     add_mutation_arguments(failure_parser)
     failure_parser.set_defaults(handler=command_record_failure)
+
+    usage_parser = subparsers.add_parser(
+        "record-usage", help="Store provider-native token counters without estimation"
+    )
+    usage_parser.add_argument("--collaboration-id", required=True)
+    usage_parser.add_argument("--worker-id", required=True)
+    usage_parser.add_argument("--source", required=True)
+    usage_parser.add_argument("--observed-at")
+    usage_parser.add_argument("--input-tokens", type=int)
+    usage_parser.add_argument("--cached-input-tokens", type=int)
+    usage_parser.add_argument("--output-tokens", type=int)
+    usage_parser.add_argument("--reasoning-output-tokens", type=int)
+    usage_parser.add_argument("--total-tokens", type=int)
+    usage_parser.add_argument("--cumulative", type=parse_bool, default=True)
+    usage_parser.add_argument("--raw-json")
+    add_mutation_arguments(usage_parser)
+    usage_parser.set_defaults(handler=command_record_usage)
 
     snapshot_parser = subparsers.add_parser("snapshot", help="Return compact resumable state")
     snapshot_parser.add_argument("--collaboration-id", required=True)

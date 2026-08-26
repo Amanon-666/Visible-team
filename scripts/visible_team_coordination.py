@@ -8,16 +8,19 @@ the returned observation/result back to the SQLite ledger.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Protocol
 
 try:  # Support both ``python -m scripts...`` and direct script imports.
     from .visible_team_state import (
         command_acknowledge,
+        command_attach_provider_worker,
         command_attach_worker,
         command_reconcile_worker_creation,
         command_record_failure,
         command_record_observation,
+        command_record_usage,
         command_reserve_host_action,
         command_set_delivery_status,
         connect,
@@ -26,10 +29,12 @@ try:  # Support both ``python -m scripts...`` and direct script imports.
 except ImportError:  # pragma: no cover - exercised only by direct embedding.
     from visible_team_state import (  # type: ignore
         command_acknowledge,
+        command_attach_provider_worker,
         command_attach_worker,
         command_reconcile_worker_creation,
         command_record_failure,
         command_record_observation,
+        command_record_usage,
         command_reserve_host_action,
         command_set_delivery_status,
         connect,
@@ -55,6 +60,9 @@ class ActionEnvelope:
     collaboration_id: str
     worker_id: str
     thread_id: str | None
+    provider: str = "codex"
+    native_task_id: str | None = None
+    native_open_ref: str | None = None
     payload: Mapping[str, Any] = field(default_factory=dict)
     idempotency_key: str | None = None
 
@@ -69,6 +77,25 @@ class HostAdapter(Protocol):
 
     def execute(self, envelope: ActionEnvelope) -> Mapping[str, Any]:
         ...
+
+
+class ProviderRouter:
+    """Route the same mechanical envelope to one explicitly named provider."""
+
+    def __init__(self, adapters: Mapping[str, HostAdapter]):
+        self.adapters = dict(adapters)
+
+    def execute(self, envelope: ActionEnvelope) -> Mapping[str, Any]:
+        adapter = self.adapters.get(envelope.provider)
+        if adapter is None:
+            return {
+                "failure": {
+                    "category": "authorization",
+                    "message": f"No adapter is configured for provider {envelope.provider!r}",
+                    "source_ref": "provider-router",
+                }
+            }
+        return adapter.execute(envelope)
 
 
 class Coordinator:
@@ -106,6 +133,12 @@ class Coordinator:
                     [],
                 )
                 payload["updates"] = pending
+                if worker["provider"] != "codex":
+                    payload["worker"] = {
+                        "model": worker["model"],
+                        "thinking": worker["thinking"],
+                        "permission_mode": worker["permission_mode"],
+                    }
             if action["kind"] == "create_worker":
                 payload.update(
                     {
@@ -115,12 +148,23 @@ class Coordinator:
                         "responsibility": worker["responsibility"],
                     }
                 )
+                if worker["provider"] != "codex":
+                    payload.update(
+                        {
+                            "provider": worker["provider"],
+                            "permission_mode": worker["permission_mode"],
+                            "dispatch_authorized": worker["dispatch_authorized"],
+                        }
+                    )
             envelopes.append(
                 ActionEnvelope(
                     action=action["kind"],
                     collaboration_id=collaboration_id,
                     worker_id=action["worker_id"],
                     thread_id=worker["thread_id"],
+                    provider=worker["provider"],
+                    native_task_id=worker["native_task_id"],
+                    native_open_ref=worker["native_open_ref"],
                     payload=payload,
                 )
             )
@@ -188,6 +232,17 @@ class Coordinator:
                     expected_version=None,
                 )
                 command_attach_worker(connection, attach_args)
+            native_task_id = response.get("native_task_id")
+            if native_task_id is not None and envelope.provider != "codex":
+                attach_provider_args = _namespace(
+                    collaboration_id=envelope.collaboration_id,
+                    worker_id=envelope.worker_id,
+                    native_task_id=native_task_id,
+                    native_open_ref=response.get("native_open_ref"),
+                    idempotency_key=f"{idempotency_key}:attach-provider",
+                    expected_version=None,
+                )
+                command_attach_provider_worker(connection, attach_provider_args)
             reconciliation = response.get("creation_reconciliation")
             if reconciliation is not None:
                 reconciliation_args = _namespace(
@@ -195,6 +250,8 @@ class Coordinator:
                     worker_id=envelope.worker_id,
                     outcome=reconciliation["outcome"],
                     thread_id=reconciliation.get("thread_id"),
+                    native_task_id=reconciliation.get("native_task_id"),
+                    native_open_ref=reconciliation.get("native_open_ref"),
                     idempotency_key=f"{idempotency_key}:creation-reconciliation",
                     expected_version=None,
                 )
@@ -236,6 +293,28 @@ class Coordinator:
                     expected_version=None,
                 )
                 command_record_failure(connection, failure_args)
+            usage = response.get("usage")
+            if usage is not None:
+                usage_args = _namespace(
+                    collaboration_id=envelope.collaboration_id,
+                    worker_id=envelope.worker_id,
+                    source=usage.get("source", envelope.provider),
+                    observed_at=usage.get("observed_at"),
+                    input_tokens=usage.get("input_tokens"),
+                    cached_input_tokens=usage.get("cached_input_tokens"),
+                    output_tokens=usage.get("output_tokens"),
+                    reasoning_output_tokens=usage.get("reasoning_output_tokens"),
+                    total_tokens=usage.get("total_tokens"),
+                    cumulative=usage.get("cumulative", True),
+                    raw_json=(
+                        None
+                        if usage.get("raw") is None
+                        else json.dumps(usage["raw"], ensure_ascii=False)
+                    ),
+                    idempotency_key=f"{idempotency_key}:usage",
+                    expected_version=None,
+                )
+                command_record_usage(connection, usage_args)
             return {"action": envelope.action, "worker_id": envelope.worker_id, "response": response}
         finally:
             connection.close()

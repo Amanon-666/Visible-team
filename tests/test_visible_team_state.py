@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "scripts" / "visible_team_state.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 import visible_team_state as state  # noqa: E402
-from visible_team_coordination import ActionEnvelope, Coordinator  # noqa: E402
+from visible_team_coordination import ActionEnvelope, Coordinator, ProviderRouter  # noqa: E402
 
 
 class VisibleTeamStateTests(unittest.TestCase):
@@ -214,18 +214,20 @@ class VisibleTeamStateTests(unittest.TestCase):
         connection.close()
 
         migrated = state.connect(str(self.db))
-        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 3)
         snapshot = state.snapshot(migrated, "old")
         self.assertEqual(snapshot["objective"], "legacy objective")
         self.assertEqual(snapshot["version"], 4)
         self.assertEqual(snapshot["workers"][0]["thread_id"], "thread-old")
         self.assertEqual(snapshot["workers"][0]["delivery_status"], "pending")
+        self.assertEqual(snapshot["workers"][0]["provider"], "codex")
+        self.assertEqual(snapshot["workers"][0]["native_task_id"], "thread-old")
         self.assertEqual(snapshot["workers"][0]["pending_updates"], 1)
         self.assertEqual(migrated.execute("SELECT COUNT(*) FROM events WHERE idempotency_key = 'legacy-event'").fetchone()[0], 1)
         migrated.close()
 
         repeated = state.connect(str(self.db))
-        self.assertEqual(repeated.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(repeated.execute("PRAGMA user_version").fetchone()[0], 3)
         self.assertEqual(repeated.execute("SELECT COUNT(*) FROM events").fetchone()[0], 1)
         repeated.close()
 
@@ -457,7 +459,7 @@ class VisibleTeamStateTests(unittest.TestCase):
             "--idempotency-key", "reviewer-missing",
         )
         resumed = self.run_cli("resume", "--collaboration-id", "project")
-        self.assertEqual(resumed["versions"]["schema"], 2)
+        self.assertEqual(resumed["versions"]["schema"], 3)
         self.assertEqual(resumed["workers"][0]["pending_context_count"], 1)
         self.assertTrue(any("missing" in note for note in resumed["notes"]))
         self.assertTrue(any(action["kind"] == "deliver_context" for action in resumed["next_actions"]))
@@ -472,6 +474,185 @@ class VisibleTeamStateTests(unittest.TestCase):
         resumed = self.run_cli("resume", "--collaboration-id", "project")
         self.assertEqual([action["kind"] for action in resumed["next_actions"]], ["create_worker"])
         self.assertTrue(any("no thread" in note for note in resumed["notes"]))
+
+    def test_external_worker_is_default_off_until_exact_authorization(self) -> None:
+        self.init()
+        planned = self.run_cli(
+            "plan-worker", "--collaboration-id", "project", "--worker-id", "agy",
+            "--title", "Antigravity worker", "--model", "gemini-3-pro",
+            "--thinking", "high", "--responsibility", "实现界面",
+            "--provider", "antigravity", "--permission-mode", "safe",
+            "--idempotency-key", "plan-agy",
+        )
+        worker = planned["workers"][0]
+        self.assertFalse(worker["dispatch_authorized"])
+        resumed = self.run_cli("resume", "--collaboration-id", "project")
+        self.assertEqual(resumed["workers"][0]["creation_state"], "awaiting_authorization")
+        self.assertEqual(
+            [action["kind"] for action in resumed["next_actions"]],
+            ["request_dispatch_authorization"],
+        )
+        connection = state.connect(str(self.db))
+        with self.assertRaisesRegex(state.StateError, "not been explicitly authorized"):
+            state.command_reserve_host_action(
+                connection,
+                type("Args", (), {
+                    "collaboration_id": "project", "worker_id": "agy",
+                    "action": "create_worker", "idempotency_key": "early-create",
+                    "expected_version": None,
+                })(),
+            )
+        connection.close()
+
+        authorized = self.run_cli(
+            "authorize-worker", "--collaboration-id", "project", "--worker-id", "agy",
+            "--approval-note", "用户确认 Antigravity / gemini-3-pro / high / safe",
+            "--idempotency-key", "authorize-agy",
+        )
+        self.assertTrue(authorized["workers"][0]["dispatch_authorized"])
+        resumed = self.run_cli("resume", "--collaboration-id", "project")
+        self.assertEqual([action["kind"] for action in resumed["next_actions"]], ["create_worker"])
+
+        changed = self.run_cli(
+            "update-worker-config", "--collaboration-id", "project", "--worker-id", "agy",
+            "--thinking", "medium", "--idempotency-key", "change-agy-thinking",
+        )
+        self.assertFalse(changed["workers"][0]["dispatch_authorized"])
+        resumed = self.run_cli("resume", "--collaboration-id", "project")
+        self.assertEqual(
+            [action["kind"] for action in resumed["next_actions"]],
+            ["request_dispatch_authorization"],
+        )
+
+    def test_external_native_identity_and_usage_are_durable(self) -> None:
+        self.init()
+        self.run_cli(
+            "plan-worker", "--collaboration-id", "project", "--worker-id", "dsh",
+            "--title", "DSH worker", "--model", "deepseek-chat",
+            "--thinking", "max", "--responsibility", "撰写报告",
+            "--provider", "deepseek-harness", "--permission-mode", "safe",
+            "--idempotency-key", "plan-dsh",
+        )
+        self.run_cli(
+            "authorize-worker", "--collaboration-id", "project", "--worker-id", "dsh",
+            "--approval-note", "用户确认 DSH / deepseek-chat / max / safe",
+            "--idempotency-key", "authorize-dsh",
+        )
+        attached = self.run_cli(
+            "attach-provider-worker", "--collaboration-id", "project", "--worker-id", "dsh",
+            "--native-task-id", "session-dsh-1", "--native-open-ref", "dsh://session/session-dsh-1",
+            "--idempotency-key", "attach-dsh",
+        )
+        self.assertIsNone(attached["workers"][0]["thread_id"])
+        self.assertEqual(attached["workers"][0]["native_task_id"], "session-dsh-1")
+        usage = self.run_cli(
+            "record-usage", "--collaboration-id", "project", "--worker-id", "dsh",
+            "--source", "dsh-session-status", "--input-tokens", "120",
+            "--cached-input-tokens", "20", "--output-tokens", "30",
+            "--reasoning-output-tokens", "10", "--total-tokens", "150",
+            "--idempotency-key", "usage-dsh-1",
+        )
+        self.assertEqual(usage["usage_recorded"]["total_tokens"], 150)
+        resumed = self.run_cli("resume", "--collaboration-id", "project")
+        self.assertEqual(resumed["workers"][0]["latest_usage"]["input_tokens"], 120)
+
+    def test_provider_router_never_substitutes_an_unconfigured_provider(self) -> None:
+        calls: list[str] = []
+
+        class FakeAdapter:
+            def execute(self, envelope: ActionEnvelope) -> dict:
+                calls.append(envelope.provider)
+                return {"native_task_id": "native-1"}
+
+        router = ProviderRouter({"antigravity": FakeAdapter()})
+        unavailable = router.execute(
+            ActionEnvelope("create_worker", "project", "dsh", None, provider="deepseek-harness")
+        )
+        self.assertEqual(unavailable["failure"]["category"], "authorization")
+        self.assertEqual(calls, [])
+        routed = router.execute(
+            ActionEnvelope("create_worker", "project", "agy", None, provider="antigravity")
+        )
+        self.assertEqual(routed["native_task_id"], "native-1")
+        self.assertEqual(calls, ["antigravity"])
+
+    def test_coordinator_persists_external_identity_and_native_usage(self) -> None:
+        self.init()
+        self.run_cli(
+            "plan-worker", "--collaboration-id", "project", "--worker-id", "agy",
+            "--title", "Antigravity worker", "--model", "gemini-3-pro",
+            "--thinking", "high", "--responsibility", "实现界面",
+            "--provider", "antigravity", "--permission-mode", "safe",
+            "--idempotency-key", "plan-agy",
+        )
+        self.run_cli(
+            "authorize-worker", "--collaboration-id", "project", "--worker-id", "agy",
+            "--approval-note", "用户确认 Antigravity / gemini-3-pro / high / safe",
+            "--idempotency-key", "authorize-agy",
+        )
+
+        class ExternalAdapter:
+            def execute(self, envelope: ActionEnvelope) -> dict:
+                self.envelope = envelope
+                return {
+                    "native_task_id": "conversation-1",
+                    "native_open_ref": "antigravity://conversation/conversation-1",
+                    "usage": {
+                        "source": "agy-result",
+                        "input_tokens": 40,
+                        "cached_input_tokens": 4,
+                        "output_tokens": 9,
+                        "reasoning_output_tokens": 3,
+                        "total_tokens": 49,
+                    },
+                }
+
+        adapter = ExternalAdapter()
+        coordinator = Coordinator(str(self.db), ProviderRouter({"antigravity": adapter}))
+        actions = coordinator.next_actions("project")
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].provider, "antigravity")
+        self.assertEqual(actions[0].payload["permission_mode"], "safe")
+        coordinator.execute(actions[0], "external-create-1")
+        resumed = self.run_cli("resume", "--collaboration-id", "project")
+        worker = resumed["workers"][0]
+        self.assertEqual(worker["native_task_id"], "conversation-1")
+        self.assertEqual(worker["latest_usage"]["total_tokens"], 49)
+
+    def test_uncertain_external_creation_can_reconcile_verified_native_identity(self) -> None:
+        self.init()
+        self.run_cli(
+            "plan-worker", "--collaboration-id", "project", "--worker-id", "agy",
+            "--title", "Antigravity worker", "--model", "gemini-3-pro",
+            "--thinking", "high", "--responsibility", "实现界面",
+            "--provider", "antigravity", "--permission-mode", "safe",
+            "--idempotency-key", "plan-agy",
+        )
+        self.run_cli(
+            "authorize-worker", "--collaboration-id", "project", "--worker-id", "agy",
+            "--approval-note", "用户确认 Antigravity / gemini-3-pro / high / safe",
+            "--idempotency-key", "authorize-agy",
+        )
+        connection = state.connect(str(self.db))
+        state.command_reserve_host_action(
+            connection,
+            type("Args", (), {
+                "collaboration_id": "project", "worker_id": "agy",
+                "action": "create_worker", "idempotency_key": "uncertain-create",
+                "expected_version": None,
+            })(),
+        )
+        connection.close()
+        resumed = self.run_cli("resume", "--collaboration-id", "project")
+        self.assertIn("reconcile_creation", [item["kind"] for item in resumed["next_actions"]])
+        reconciled = self.run_cli(
+            "reconcile-worker-creation", "--collaboration-id", "project",
+            "--worker-id", "agy", "--outcome", "attached",
+            "--native-task-id", "conversation-recovered",
+            "--native-open-ref", "antigravity://conversation/conversation-recovered",
+            "--idempotency-key", "reconcile-agy",
+        )
+        self.assertEqual(reconciled["workers"][0]["native_task_id"], "conversation-recovered")
 
     def test_failure_categories_explain_manual_action(self) -> None:
         self.init()

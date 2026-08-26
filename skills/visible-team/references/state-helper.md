@@ -16,6 +16,12 @@ The bundled helper is a dependency-free Python CLI backed by SQLite. The Leader 
 - Worker lifecycle completion is separate from delivery acceptance. A completed Worker must have a submitted delivery with a summary or result/artifact reference; a host task that is complete but has no verifiable result is recorded as `needs_attention`.
 - Failure categories are advisory state, not retry instructions. `transient` is retryable in principle, but the Leader must explicitly trigger any host retry; the helper and coordinator never loop or retry automatically.
 - Host observations are facts supplied by the Leader or a host adapter. The SQLite helper never queries or claims to query Codex.
+- Every Worker has a provider-neutral native identity. Codex uses its thread ID;
+  external providers preserve their own verified session/task ID.
+- External provider dispatch is off until the exact provider/model/thinking/
+  permission allocation is recorded with `authorize-worker`.
+- Token counters come from the native provider and unknown fields remain
+  unavailable; the helper does not estimate usage.
 
 ## Commands
 
@@ -42,15 +48,30 @@ python3 scripts/visible_team_state.py --db <chosen-db> plan-worker \
   --responsibility <scope> \
   --idempotency-key <stable-operation-id>
 
+# For an external Worker, also pass --provider and --permission-mode. Planning
+# remains non-authorizing until this separate user-approval record exists:
+python3 scripts/visible_team_state.py --db <chosen-db> authorize-worker \
+  --collaboration-id <stable-id> --worker-id <logical-worker-id> \
+  --approval-note <exact-approved-allocation> \
+  --idempotency-key <stable-operation-id>
+
 python3 scripts/visible_team_state.py --db <chosen-db> attach-worker \
   --collaboration-id <stable-id> \
   --worker-id <logical-worker-id> \
   --thread-id <created-thread-id> \
   --idempotency-key <stable-operation-id>
 
+python3 scripts/visible_team_state.py --db <chosen-db> attach-provider-worker \
+  --collaboration-id <stable-id> --worker-id <logical-worker-id> \
+  --native-task-id <verified-provider-session-id> \
+  --native-open-ref <optional-provider-reference> \
+  --idempotency-key <stable-operation-id>
+
 python3 scripts/visible_team_state.py --db <chosen-db> reconcile-worker-creation \
   --collaboration-id <stable-id> --worker-id <logical-worker-id> \
-  --outcome missing|retry|attached [--thread-id <thread-id>] \
+  --outcome missing|retry|attached [--thread-id <codex-thread-id>] \
+  [--native-task-id <external-session-id>] \
+  [--native-open-ref <optional-provider-reference>] \
   --idempotency-key <stable-operation-id>
 
 python3 scripts/visible_team_state.py --db <chosen-db> update-worker-config \
@@ -92,6 +113,12 @@ python3 scripts/visible_team_state.py --db <chosen-db> record-failure \
   --category transient --message <what-failed> \
   --idempotency-key <stable-operation-id>
 
+python3 scripts/visible_team_state.py --db <chosen-db> record-usage \
+  --collaboration-id <stable-id> --worker-id <logical-worker-id> \
+  --source <native-usage-source> --input-tokens <count> \
+  --output-tokens <count> --total-tokens <count> \
+  --idempotency-key <stable-operation-id>
+
 python3 scripts/visible_team_state.py --db <chosen-db> resume \
   --collaboration-id <stable-id>
 
@@ -102,7 +129,7 @@ python3 scripts/visible_team_usage.py --db <chosen-db> \
   --collaboration-id <stable-id> [--codex-home <codex-home>] [--json]
 ```
 
-`visible_team_usage.py` 只读宿主 rollout 的最新 `token_count`；rollout 明细不可用时才使用 `state_*.sqlite` 的总量回退，不显示价格、额度或限制。
+`visible_team_usage.py` 对 Codex 只读宿主 rollout 的最新 `token_count`，明细不可用时才使用 `state_*.sqlite` 的总量回退；对外部 Provider 读取 ledger 中已经记录的原生用量。它不显示价格、额度或限制，也不估算缺失字段。
 
 `--target all` is available for a genuinely global change. Prefer explicit affected Worker IDs.
 

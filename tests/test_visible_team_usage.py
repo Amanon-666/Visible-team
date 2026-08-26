@@ -230,6 +230,64 @@ class VisibleTeamUsageTests(unittest.TestCase):
         self.assertEqual(worker["source"], usage.UNAVAILABLE)
         self.assertEqual(worker["total_tokens"], usage.UNAVAILABLE)
 
+    def test_external_provider_uses_recorded_native_usage_not_codex_rollouts(self) -> None:
+        connection = sqlite3.connect(self.db)
+        connection.executescript(
+            """
+            CREATE TABLE collaborations (
+                collaboration_id TEXT PRIMARY KEY,
+                leader_thread_id TEXT
+            );
+            CREATE TABLE workers (
+                collaboration_id TEXT,
+                worker_id TEXT,
+                thread_id TEXT,
+                provider TEXT,
+                native_task_id TEXT,
+                model TEXT,
+                thinking TEXT,
+                created_at TEXT
+            );
+            CREATE TABLE worker_usage (
+                usage_id INTEGER PRIMARY KEY,
+                collaboration_id TEXT,
+                worker_id TEXT,
+                source TEXT,
+                observed_at TEXT,
+                input_tokens INTEGER,
+                cached_input_tokens INTEGER,
+                output_tokens INTEGER,
+                reasoning_output_tokens INTEGER,
+                total_tokens INTEGER
+            );
+            """
+        )
+        connection.execute("INSERT INTO collaborations VALUES ('project', NULL)")
+        connection.execute(
+            "INSERT INTO workers VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "project", "agy", None, "antigravity", "conversation-1",
+                "gemini-3-pro", "high", "2026-01-01",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO worker_usage VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                1, "project", "agy", "agy-result", "2026-01-02T00:00:00Z",
+                50, 5, 12, 4, 62,
+            ),
+        )
+        connection.commit()
+        connection.close()
+
+        report = self.report()
+        row = report["rows"][1]
+        self.assertEqual(row["provider"], "antigravity")
+        self.assertEqual(row["native_task_id"], "conversation-1")
+        self.assertEqual(row["source"], "agy-result")
+        self.assertEqual(row["uncached_input_tokens"], 45)
+        self.assertEqual(row["total_tokens"], 62)
+
 
 if __name__ == "__main__":
     unittest.main()

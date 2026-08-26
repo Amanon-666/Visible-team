@@ -18,3 +18,18 @@ context, and the Leader coordinates meaningful follow-ups through completion.
 The SQLite collaboration-state helper and its selective context-delivery model
 are original additions in this derivative. They provide optional deterministic
 state without reintroducing the upstream project's fixed team structure.
+
+The external-provider boundary was informed by two additional open-source
+projects without importing their full runtimes:
+
+- Orkestra (`andyyaro/orkestra`, Apache-2.0): small adapter metadata,
+  argv-based invocation, incremental structured-output parsing, native session
+  references, and explicit error/usage normalization.
+- AGPair (`logicrw/agpair`, MIT): minimal provider lifecycle and honest
+  capability declarations for start, continuation, observation, and cleanup.
+
+The Antigravity adapter uses the installed `agy` CLI's documented
+`stream-json` protocol. The DeepSeek Harness adapter wraps its official local
+Python SDK and protocol types. Both remain thin translations into Visible
+Team's provider-neutral state; neither vendors the upstream orchestration,
+worktree, role, queue, or runtime implementations.

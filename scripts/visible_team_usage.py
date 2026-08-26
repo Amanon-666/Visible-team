@@ -124,12 +124,17 @@ def read_targets(db_path: str, collaboration_id: str) -> list[dict[str, Any]]:
             raise UsageError("Unsupported workers table")
         model = _first(worker_columns, ("model",))
         thinking = _first(worker_columns, ("thinking",))
+        provider = _first(worker_columns, ("provider",))
+        native_task = _first(worker_columns, ("native_task_id",))
         order = "created_at, worker_id" if "created_at" in worker_columns else "worker_id"
         model_sql = _quote_identifier(model) if model else "NULL"
         thinking_sql = _quote_identifier(thinking) if thinking else "NULL"
+        provider_sql = _quote_identifier(provider) if provider else "'codex'"
+        native_task_sql = _quote_identifier(native_task) if native_task else "thread_id"
         rows = connection.execute(
             f"""SELECT worker_id, thread_id, {model_sql} AS model,
-                       {thinking_sql} AS thinking
+                       {thinking_sql} AS thinking, {provider_sql} AS provider,
+                       {native_task_sql} AS native_task_id
                 FROM workers WHERE collaboration_id = ? ORDER BY {order}""",
             (collaboration_id,),
         ).fetchall()
@@ -137,16 +142,48 @@ def read_targets(db_path: str, collaboration_id: str) -> list[dict[str, Any]]:
             "role": "leader",
             "worker_id": "leader",
             "thread_id": _text(collaboration["leader_thread_id"]),
+            "provider": "codex",
+            "native_task_id": _text(collaboration["leader_thread_id"]),
             "model": None,
             "thinking": None,
+            "ledger_usage": None,
         }]
-        targets.extend({
-            "role": "worker",
-            "worker_id": _text(row["worker_id"]) or UNAVAILABLE,
-            "thread_id": _text(row["thread_id"]),
-            "model": _text(row["model"]),
-            "thinking": _text(row["thinking"]),
-        } for row in rows)
+        usage_available = "worker_usage" in tables
+        for row in rows:
+            ledger_usage: Record | None = None
+            if usage_available:
+                usage = connection.execute(
+                    """
+                    SELECT source, observed_at, input_tokens, cached_input_tokens,
+                           output_tokens, reasoning_output_tokens, total_tokens
+                    FROM worker_usage
+                    WHERE collaboration_id = ? AND worker_id = ?
+                    ORDER BY usage_id DESC LIMIT 1
+                    """,
+                    (collaboration_id, row["worker_id"]),
+                ).fetchone()
+                if usage is not None:
+                    values = {
+                        field: value
+                        for field in RAW_FIELDS
+                        if (value := _integer(usage[field])) is not None
+                    }
+                    ledger_usage = (
+                        _text(usage["source"]) or "provider-ledger",
+                        _text(usage["observed_at"]),
+                        values,
+                        (0, 0, 0, 0),
+                    )
+            targets.append({
+                "role": "worker",
+                "worker_id": _text(row["worker_id"]) or UNAVAILABLE,
+                "thread_id": _text(row["thread_id"]),
+                "provider": _text(row["provider"]) or "codex",
+                "native_task_id": _text(row["native_task_id"]),
+                "model": _text(row["model"]),
+                "thinking": _text(row["thinking"]),
+                "ledger_usage": ledger_usage,
+            })
         return targets
     except sqlite3.Error as error:
         raise UsageError(f"Cannot read collaboration database: {error}") from error
@@ -363,7 +400,9 @@ def _row(target: dict[str, Any], record: Record | None) -> dict[str, Any]:
     return {
         "role": target["role"],
         "worker_id": target["worker_id"],
+        "provider": target.get("provider") or UNAVAILABLE,
         "thread_id": target["thread_id"] or UNAVAILABLE,
+        "native_task_id": target.get("native_task_id") or UNAVAILABLE,
         "model": target["model"] or UNAVAILABLE,
         "thinking": target["thinking"] or UNAVAILABLE,
         "source": record[0] if record else UNAVAILABLE,
@@ -376,8 +415,8 @@ def _total(rows: list[dict[str, Any]], targets: list[dict[str, Any]]) -> dict[st
     unique: list[dict[str, Any]] = []
     seen: set[str] = set()
     for index, (row, target) in enumerate(zip(rows, targets)):
-        thread_id = target.get("thread_id")
-        key = thread_id or f"missing:{index}"
+        native_task_id = target.get("native_task_id") or target.get("thread_id")
+        key = f"{target.get('provider', 'codex')}:{native_task_id or f'missing:{index}'}"
         if key in seen:
             continue
         seen.add(key)
@@ -394,7 +433,9 @@ def _total(rows: list[dict[str, Any]], targets: list[dict[str, Any]]) -> dict[st
     return {
         "role": "total",
         "worker_id": "total",
+        "provider": UNAVAILABLE,
         "thread_id": UNAVAILABLE,
+        "native_task_id": UNAVAILABLE,
         "model": UNAVAILABLE,
         "thinking": UNAVAILABLE,
         "source": "aggregate" if unique else UNAVAILABLE,
@@ -409,7 +450,12 @@ def build_report(db_path: str, collaboration_id: str, codex_home: str) -> dict[s
     fallback = find_state_fallback(codex_home, (target["thread_id"] for target in targets))
     records = dict(fallback)
     records.update(rollout)  # rollout detail always wins over fallback totals
-    rows = [_row(target, records.get(target["thread_id"])) for target in targets]
+    rows = []
+    for target in targets:
+        record = records.get(target["thread_id"])
+        if target.get("provider") != "codex":
+            record = target.get("ledger_usage")
+        rows.append(_row(target, record))
     return {
         "collaboration_id": collaboration_id,
         "rows": rows,
@@ -419,7 +465,8 @@ def build_report(db_path: str, collaboration_id: str, codex_home: str) -> dict[s
 
 def format_table(report: dict[str, Any]) -> str:
     columns = (
-        "role", "worker_id", "thread_id", "model", "thinking", "source",
+        "role", "worker_id", "provider", "native_task_id", "thread_id",
+        "model", "thinking", "source",
         "observed_at", *DISPLAY_FIELDS,
     )
     rows = [*report["rows"], report["total"]]
