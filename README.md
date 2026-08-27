@@ -25,6 +25,7 @@ Visible Team 是一个 Codex Skill、轻量状态助手和可插拔 Provider 层
 ```text
 skills/visible-team/SKILL.md     Codex 协作规则
 skills/visible-team/agents/      Skill 界面与自动调用策略
+dsh-plugin/                      独立可安装的 DSH Visible Team 插件
 scripts/visible_team_state.py    可选的持久状态助手
 scripts/visible_team_external.py 经授权后执行一次外部 Provider 动作
 scripts/visible_team_usage.py    只读的宿主 Token 用量查看
@@ -79,6 +80,23 @@ python3 scripts/visible_team_external.py --provider deepseek-harness \
 助手只负责确定性状态，不替模型决定任务如何拆分，也不替代 Codex 原生的可见任务和消息工具。Worker 的生命周期完成、Leader 收到/接受交付、宿主观察和整体 collaboration 完成是分开的状态。完整命令见 [状态助手说明](skills/visible-team/references/state-helper.md)。
 
 需要核对宿主原生 Token 用量时，可运行 `scripts/visible_team_usage.py --db <chosen-db> --collaboration-id <stable-id> [--codex-home <codex-home>]`；加 `--json` 输出稳定 JSON。Codex 用量来自 rollout/state，外部用量来自适配器写入的原生计数，缺失明细会明确显示 `unavailable`。
+
+## DSH Visible Team 插件
+
+`dsh-plugin/` 是独立的 DSH 插件，不修改 DSH 源码。它在 DSH 的
+`conversation.view` 注册 Team tab，把协作空间、定向 Context Packet 和
+原生 Token observation 保存在插件自己的 SQLite 中。新 Agent 挂接时会生成一次
+只指向该 Agent 的 objective/sharedRules bootstrap 包，由用户或 Leader 明确点击
+投递；后续直接指挥不会重复注入。全局规则变化也不会隐式广播，需用明确目标创建
+上下文增量。
+
+UI 与未来 Leader 使用同一个 Host action contract：
+`POST /api/visible-team/workspaces`，请求体是 `WorkspaceAction`。当前切片已提供
+UI 和 HTTP 的可编程入口，但尚未注册 DSH 模型工具，因此尚未实现“自主 Leader
+协作”；任何后续模型工具都必须转发到这一个 action contract。安装、兼容性和
+开源归属见 [dsh-plugin/README.md](dsh-plugin/README.md)、
+[dsh-plugin/ARCHITECTURE.md](dsh-plugin/ARCHITECTURE.md) 和
+[dsh-plugin/COMPATIBILITY.md](dsh-plugin/COMPATIBILITY.md)。
 
 ## 设计边界
 

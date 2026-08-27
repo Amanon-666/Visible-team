@@ -33,3 +33,10 @@ The Antigravity adapter uses the installed `agy` CLI's documented
 Python SDK and protocol types. Both remain thin translations into Visible
 Team's provider-neutral state; neither vendors the upstream orchestration,
 worktree, role, queue, or runtime implementations.
+
+The independent `dsh-plugin/` package additionally records its DSH-specific
+attributions in [`dsh-plugin/NOTICE.md`](dsh-plugin/NOTICE.md). Its public Slot
+and bundle layout is informed by the MIT-licensed `dsh-workbench`; its
+replaceable provider seam is informed by the MIT-licensed
+`dsh-plugin-subagents`. Neither project's file editor, terminal, relay runtime,
+role catalog, or state database is vendored into the plugin.

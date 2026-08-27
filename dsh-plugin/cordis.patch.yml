@@ -1,0 +1,5 @@
+# Mount Visible Team in the DSH Host. The package's client entry is discovered
+# through package.json dsh.client metadata.
+- insert:
+    - id: visible-team
+      name: 'dsh-visible-team'
