@@ -1,8 +1,10 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import { API_PATH, CONTEXT_PATH, EVENTS_PATH, type AgentDriverResult, type CapabilityUnavailable, type ContextPacket, type TeamAgent, type WorkspaceAction, type WorkspaceCommandResult, type WorkspaceStateAction } from "../shared/types.js";
+import { API_PATH, CONTEXT_PATH, EVENTS_PATH, type AgentDriverResult, type CapabilityUnavailable, type ContextPacket, type WorkspaceAction, type WorkspaceCommandResult, type WorkspaceStateAction } from "../shared/types.js";
 import { readJson, sendJson } from "./http.js";
-import { createDshDriver, type DshApiProxy } from "./dsh-adapter.js";
+import { createDshDriver, type DshApiProxy, type DshDriverOptions } from "./dsh-adapter.js";
+import { AgentDriverCapabilityError, isAgentDriverCapabilityError, type AgentDriver, type AgentDriverRoute } from "./driver.js";
+import { registerVisibleTeamModelTool, type ToolRuntimeLike } from "./model-tool.js";
 import { VisibleTeamStore, type StoreConfig } from "./store.js";
 
 type WebServer = {
@@ -15,6 +17,14 @@ type WebServer = {
 
 type InjectionHandle = { dispose?: () => void } | void;
 
+type InjectedHostContext = {
+  webServer: WebServer;
+  get?: (name: string) => unknown;
+  effect?: (factory: () => (() => void) | void, name?: string) => void;
+  apiProxy?: DshApiProxy;
+  tools?: ToolRuntimeLike;
+};
+
 type HostContext = {
   webServer: WebServer;
   get?: (name: string) => unknown;
@@ -24,52 +34,29 @@ type HostContext = {
    * DSH driver cannot accidentally capture an undeclared service.
    */
   inject?: (
-    services: readonly ["apiProxy"],
-    callback: (ctx: HostContext & { apiProxy: DshApiProxy }) => void,
+    services: readonly ["apiProxy"] | readonly ["tools"],
+    callback: (ctx: InjectedHostContext) => void,
   ) => InjectionHandle;
   effect?: (factory: () => (() => void) | void, name?: string) => void;
 };
 
-export interface DriverInput {
-  workspaceId: string;
-  agent: TeamAgent;
-  content: string;
-  packetVersions?: number[];
-}
-
-/** Optional provider seam. A driver owns transport; the core owns identity/state. */
-export interface AgentDriver {
-  provider: string;
-  send(input: DriverInput): Promise<AgentDriverResult>;
-  create?(input: {
-    workspaceId: string;
-    displayName: string;
-    model?: string;
-    thinking?: string;
-    permissionMode?: string;
-    responsibility?: string;
-  }): Promise<{
-    nativeSessionId: string;
-    nativeOpenRef?: string;
-  }>;
-}
-
 export interface Config extends StoreConfig {
   /** Test/embedding seam; ordinary package installs have no external driver by default. */
   drivers?: readonly AgentDriver[];
+  /** Optional explicit native model provider for the built-in DSH adapter. */
+  dsh?: DshDriverOptions;
 }
 
 export const name = "visible-team";
 export const inject = ["webServer"];
 
-export class CapabilityUnavailableError extends Error implements CapabilityUnavailable {
-  readonly code = "capability-unavailable" as const;
+export class CapabilityUnavailableError extends AgentDriverCapabilityError implements CapabilityUnavailable {
   constructor(
     readonly capability: string,
     message: string,
     readonly provider?: string,
   ) {
-    super(message);
+    super(capability, message, provider);
     this.name = "CapabilityUnavailableError";
   }
 }
@@ -78,7 +65,7 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function unavailablePayload(error: CapabilityUnavailableError): CapabilityUnavailable {
+function unavailablePayload(error: AgentDriverCapabilityError): CapabilityUnavailable {
   return {
     code: error.code,
     capability: error.capability,
@@ -105,6 +92,24 @@ function throughVersion(value: unknown): number | undefined {
   if (value === undefined) return undefined;
   if (!Number.isSafeInteger(value) || Number(value) < 0) throw new Error("throughVersion must be a non-negative integer");
   return Number(value);
+}
+
+function routeFromAction(
+  provider: string,
+  nativeProvider: string | undefined,
+  model: string | undefined,
+  thinking: string | undefined,
+  permissionMode: string | undefined,
+): AgentDriverRoute | undefined {
+  if (typeof model !== "string" || !model.trim()) return undefined;
+  if (typeof thinking !== "string" || !thinking.trim()) return undefined;
+  if (typeof permissionMode !== "string" || !permissionMode.trim()) return undefined;
+  return {
+    provider: typeof nativeProvider === "string" && nativeProvider.trim() ? nativeProvider.trim() : provider,
+    model: model.trim(),
+    thinking: thinking.trim(),
+    permissions: { mode: permissionMode.trim() },
+  };
 }
 
 function driverRegistry(ctx: HostContext, config: Config): Map<string, AgentDriver> {
@@ -153,6 +158,43 @@ async function executeAction(
   drivers: Map<string, AgentDriver>,
   action: WorkspaceAction,
 ): Promise<WorkspaceCommandResult> {
+  if (action.action === "attach-agent") {
+    const driver = drivers.get(action.binding.provider);
+    // Verification is opt-in at the seam. Existing custom drivers can keep
+    // state-only attachment, while an attach-capable driver gets a real
+    // native-session existence check when the caller supplied a full route.
+    if (driver?.attach !== undefined) {
+      const route = routeFromAction(
+        action.binding.provider,
+        action.nativeProvider,
+        action.model,
+        action.thinking,
+        action.permissionMode,
+      );
+      if (route !== undefined) {
+        const attached = await driver.attach({
+          workspaceId: action.workspaceId,
+          displayName: action.displayName,
+          nativeSessionId: action.binding.nativeSessionId,
+          nativeOpenRef: action.binding.nativeOpenRef,
+          route,
+        });
+        if (attached.nativeSessionId !== action.binding.nativeSessionId) {
+          throw new Error(`driver ${action.binding.provider} returned a different native session id during attach`);
+        }
+        const verifiedAction: typeof action = {
+          ...action,
+          binding: {
+            ...action.binding,
+            ...(attached.nativeOpenRef === undefined ? {} : { nativeOpenRef: attached.nativeOpenRef ?? undefined }),
+          },
+        };
+        const workspace = store.dispatch(verifiedAction);
+        return { workspaces: [workspace] };
+      }
+    }
+  }
+
   if (isStateAction(action)) {
     const workspace = store.dispatch(action);
     return { workspaces: [workspace] };
@@ -174,6 +216,7 @@ async function executeAction(
       model: action.model,
       thinking: action.thinking,
       permissionMode: action.permissionMode,
+      nativeProvider: action.nativeProvider,
       responsibility: action.responsibility,
     });
     if (!created || typeof created.nativeSessionId !== "string" || !created.nativeSessionId.trim()) {
@@ -183,8 +226,9 @@ async function executeAction(
       workspaceId: workspace.workspaceId,
       displayName: action.displayName,
       provider: action.provider,
+      nativeProvider: action.nativeProvider,
       nativeSessionId: created.nativeSessionId,
-      nativeOpenRef: created.nativeOpenRef,
+      ...(created.nativeOpenRef === null || created.nativeOpenRef === undefined ? {} : { nativeOpenRef: created.nativeOpenRef }),
       model: action.model,
       thinking: action.thinking,
       permissionMode: action.permissionMode,
@@ -263,8 +307,8 @@ export function apply(ctx: HostContext, config: Config = {}): void {
   // native Session must still work on a host without the gateway. The child
   // injection is the public Cordis declaration for the DSH-only capability.
   const apiProxyFiber = ctx.inject?.(["apiProxy"], (apiCtx) => {
-    if (hasConfiguredDshDriver) return;
-    const dsh = createDshDriver(apiCtx.apiProxy);
+    if (hasConfiguredDshDriver || apiCtx.apiProxy === undefined) return;
+    const dsh = createDshDriver(apiCtx.apiProxy, config.dsh);
     if (dsh === undefined) return;
     injectedDshDriver = dsh;
     drivers.set(dsh.provider, dsh);
@@ -282,6 +326,22 @@ export function apply(ctx: HostContext, config: Config = {}): void {
       try { client.write(`event: change\ndata: ${payload}\n\n`); } catch { clients.delete(client); }
     }
   };
+
+  // Model tools are an optional public DSH service. Registration is owned by
+  // the injected ToolRuntime; the body still calls this Host's existing
+  // action executor, so it cannot create a second queue or state machine.
+  const modelToolFiber = ctx.inject?.(["tools"], (toolCtx) => {
+    if (toolCtx.tools === undefined) return;
+    registerVisibleTeamModelTool(
+      toolCtx.tools,
+      store,
+      async action => {
+        const result = await executeAction(ctx, store, drivers, action);
+        broadcast(result.workspaces[0]?.workspaceId);
+        return result;
+      },
+    );
+  });
 
   routeDisposers.push(ctx.webServer.register({
     kind: "exact",
@@ -305,7 +365,9 @@ export function apply(ctx: HostContext, config: Config = {}): void {
         broadcast(result.workspaces[0]?.workspaceId);
         return sendJson(res, 200, result);
       } catch (error) {
-        if (error instanceof CapabilityUnavailableError) return sendJson(res, 409, unavailablePayload(error));
+        if (error instanceof CapabilityUnavailableError || isAgentDriverCapabilityError(error)) {
+          return sendJson(res, 409, unavailablePayload(error));
+        }
         return sendJson(res, 400, { error: message(error) });
       }
     },
@@ -352,6 +414,7 @@ export function apply(ctx: HostContext, config: Config = {}): void {
 
   const dispose = (): void => {
     apiProxyFiber?.dispose?.();
+    modelToolFiber?.dispose?.();
     for (const disposeRoute of routeDisposers.splice(0)) disposeRoute();
     for (const client of clients) client.end();
     clients.clear();
@@ -361,4 +424,25 @@ export function apply(ctx: HostContext, config: Config = {}): void {
 }
 
 export { VisibleTeamStore } from "./store.js";
-export type { DshApiProxy } from "./dsh-adapter.js";
+export { AGENT_DRIVER_CAPABILITIES, AgentDriverCapabilityError, explicitRouteForAgent, isAgentDriverCapabilityError, nativeUsageToDriverResult } from "./driver.js";
+export type {
+  AgentDriver,
+  AgentDriverAttachInput,
+  AgentDriverAttachment,
+  AgentDriverCapabilities,
+  AgentDriverCapability,
+  AgentDriverCapabilityName,
+  AgentDriverCapabilityStatus,
+  AgentDriverCreateInput,
+  AgentDriverDiscovery,
+  AgentDriverObservation,
+  AgentDriverOpenResult,
+  AgentDriverRoute,
+  AgentDriverSessionInput,
+  AgentDriverUsageResult,
+  AgentDriverWatchEvent,
+  DriverInput,
+  NativeUsageObservation,
+} from "./driver.js";
+export { createDshDriver } from "./dsh-adapter.js";
+export type { DshApiProxy, DshDriverOptions, DshEventsApi, DshHistoryEntry, DshPromptContentPart, DshRpcError, DshRpcRequest, DshRpcResponse, DshRpcResult, DshSessionProjectionBlock, DshSessionSummary, DshSessionsApi } from "./dsh-adapter.js";

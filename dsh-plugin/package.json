@@ -1,6 +1,6 @@
 {
   "name": "dsh-visible-team",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Visible cross-application agent workspaces for DeepSeek Harness.",
   "license": "MIT",
   "type": "module",
@@ -48,10 +48,16 @@
     "test": "vitest run",
     "check": "pnpm run test && pnpm run build"
   },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.1.1-rc.1 <0.2.0"
+  },
   "devDependencies": {
+    "@deepseek-ai/dsh-client-ui-primitives": "0.1.1-rc.1",
+    "@deepseek-ai/dsh-tools": "0.1.1-rc.1",
     "@types/node": "^22.20.0",
     "@types/react": "^18.3.1",
     "@types/react-dom": "^18.3.7",
+    "lightningcss": "1.33.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "tsdown": "^0.22.14",

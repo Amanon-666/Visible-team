@@ -171,6 +171,28 @@ describe("VisibleTeamStore", () => {
     })).toThrow(/connected driver/);
   });
 
+  it("persists an explicit native model provider without changing the driver identity", () => {
+    const db = store();
+    const workspace = createWorkspace(db);
+    const result = db.dispatch({
+      action: "attach-agent",
+      workspaceId: workspace.workspaceId,
+      displayName: "Routed DSH",
+      nativeProvider: "deepseek-official",
+      model: "deepseek-chat",
+      thinking: "high",
+      permissionMode: "safe",
+      binding: { provider: "dsh", nativeSessionId: "session-routed" },
+      attachSource: "manual",
+    });
+    expect(result.agents[0]?.binding).toEqual({
+      provider: "dsh",
+      nativeProvider: "deepseek-official",
+      nativeSessionId: "session-routed",
+      nativeOpenRef: null,
+    });
+  });
+
   it("stores context packets with transactionally increasing versions and explicit targets", () => {
     const db = store();
     const workspace = createWorkspace(db);

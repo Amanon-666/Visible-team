@@ -1,12 +1,29 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { apply, inject } from "../src/client/entry.js";
+import { apply, inject, TeamWorkbench } from "../src/client/entry.js";
+
+// The contract test does not render the browser surface. Keep the test runner
+// on Node's CSS-free path while the production bundle still consumes DSH's
+// official primitives through the public module-loader external.
+vi.mock("@deepseek-ai/dsh-client-ui-primitives", () => {
+  const Empty = () => null;
+  return {
+    Button: Empty,
+    IconAgentPresetOutline16: Empty,
+    IconCloseOutline16: Empty,
+    IconPlusOutline16: Empty,
+    IconRefreshOutline16: Empty,
+    Input: Empty,
+    Tooltip: Empty,
+    useDismissOnOutsidePointer: () => {},
+  };
+});
 
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
 describe("Visible Team Client injection contract", () => {
-  it("declares public slots/sessions services and registers the Team tab through conversation.view", () => {
+  it("declares public slots/sessions services and registers both the Team tab and sidebar entry", () => {
     expect(inject).toEqual(["slots", "sessions"]);
 
     const registered: { options: Record<string, unknown>; component: unknown }[] = [];
@@ -33,8 +50,8 @@ describe("Visible Team Client injection contract", () => {
 
     apply(ctx);
 
-    expect(injectedSlots).toEqual(["conversation.view"]);
-    expect(registered).toHaveLength(1);
+    expect(injectedSlots).toEqual(["conversation.view", "sidebar.footer.action"]);
+    expect(registered).toHaveLength(2);
     expect(registered[0]?.options).toMatchObject({
       name: "conversation.view",
       id: "visible-team",
@@ -48,6 +65,15 @@ describe("Visible Team Client injection contract", () => {
     expect(perSession.currentSessionId).toBe("session-1");
     perSession.openSession?.("session-2");
     expect(opened).toEqual(["session-2"]);
+    expect(registered[1]?.options).toMatchObject({
+      name: "sidebar.footer.action",
+      id: "visible-team-workbench",
+      order: 20,
+      label: "协作工作台",
+    });
+    expect(registered[1]?.component).toBe(TeamWorkbench);
+    const footerProps = (registered[1]?.options.inject as () => { team: unknown })();
+    expect(footerProps.team).toBeDefined();
     expect(effects).toHaveLength(1);
   });
 });

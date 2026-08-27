@@ -24,6 +24,8 @@ export interface HostBinding {
 /** The only identity the collaboration core needs for an attached Agent. */
 export interface AgentBinding {
   provider: string;
+  /** Optional native model-provider route, distinct from the transport driver. */
+  nativeProvider?: string;
   nativeSessionId: string;
   nativeOpenRef: string | null;
 }
@@ -125,6 +127,8 @@ export type WorkspaceAction =
         nativeSessionId: string;
         nativeOpenRef?: string;
       };
+      /** Optional upstream model-provider id for an attach-capable driver. */
+      nativeProvider?: string;
       model?: string;
       thinking?: string;
       permissionMode?: string;
@@ -138,6 +142,8 @@ export type WorkspaceAction =
       workspaceId: string;
       displayName: string;
       provider: string;
+      /** Required by drivers that need a provider distinct from their transport id. */
+      nativeProvider?: string;
       model?: string;
       thinking?: string;
       permissionMode?: string;

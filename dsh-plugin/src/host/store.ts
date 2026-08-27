@@ -102,6 +102,7 @@ function parseHostBinding(row: Row): HostBinding | null {
 function parseAgentBinding(row: Row): AgentBinding {
   return {
     provider: String(row.provider),
+    ...(row.native_provider === null || row.native_provider === undefined ? {} : { nativeProvider: String(row.native_provider) }),
     nativeSessionId: String(row.native_session_id),
     nativeOpenRef: row.native_open_ref === null ? null : String(row.native_open_ref),
   };
@@ -167,6 +168,7 @@ export class VisibleTeamStore {
         workspace_id TEXT NOT NULL,
         display_name TEXT NOT NULL,
         provider TEXT NOT NULL,
+        native_provider TEXT,
         native_session_id TEXT NOT NULL,
         native_open_ref TEXT,
         model TEXT,
@@ -228,6 +230,7 @@ export class VisibleTeamStore {
     // that host-specific name in the core contract.
     addColumn(this.db, "vt_workspaces", "host_binding_kind", "TEXT");
     addColumn(this.db, "vt_workspaces", "host_binding_ref", "TEXT");
+    addColumn(this.db, "vt_agents", "native_provider", "TEXT");
     const workspaceColumns = tableColumns(this.db, "vt_workspaces");
     if (workspaceColumns.has("dsh_workspace_id")) {
       this.db.exec(`
@@ -246,8 +249,8 @@ export class VisibleTeamStore {
     // global fence prevents one provider session from being attached to two
     // collaboration spaces and therefore acquiring two bridge owners.
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS vt_agent_native_owner_idx ON vt_agents(provider, native_session_id)");
-    this.db.prepare("INSERT OR IGNORE INTO vt_meta(key, value) VALUES ('schema_version', '4')").run();
-    this.db.prepare("UPDATE vt_meta SET value = '4' WHERE key = 'schema_version'").run();
+    this.db.prepare("INSERT OR IGNORE INTO vt_meta(key, value) VALUES ('schema_version', '5')").run();
+    this.db.prepare("UPDATE vt_meta SET value = '5' WHERE key = 'schema_version'").run();
   }
 
   /**
@@ -318,6 +321,27 @@ export class VisibleTeamStore {
 
   getAgent(workspaceId: string, agentId: string): TeamAgent {
     return this.mapAgent(this.agentRow(workspaceId, agentId));
+  }
+
+  /**
+   * Resolve the caller's public native identity without accepting a workspace
+   * id from the caller. The global owner index makes this a single binding;
+   * the returned Agent is then used to derive its only workspace.
+   */
+  findAgentByNativeSession(provider: string, nativeSessionId: string): TeamAgent | undefined {
+    if (typeof provider !== "string" || typeof nativeSessionId !== "string") return undefined;
+    const cleanProvider = provider.trim();
+    const cleanSession = nativeSessionId.trim();
+    if (!cleanProvider || !cleanSession) return undefined;
+    const row = this.db.prepare(`
+      SELECT a.*,
+             SUM(CASE WHEN t.update_id IS NOT NULL AND t.delivered_at IS NULL THEN 1 ELSE 0 END) AS pending_context
+      FROM vt_agents a
+      LEFT JOIN vt_context_targets t ON t.agent_id = a.agent_id
+      WHERE a.provider = ? AND a.native_session_id = ?
+      GROUP BY a.agent_id
+    `).get(cleanProvider, cleanSession) as Row | undefined;
+    return row === undefined ? undefined : this.mapAgent(row);
   }
 
   listWorkspaces(): TeamWorkspace[] {
@@ -554,7 +578,12 @@ export class VisibleTeamStore {
     return this.insertAgent({
       workspaceId: action.workspaceId,
       displayName: action.displayName,
-      binding: { provider, nativeSessionId, nativeOpenRef: action.binding.nativeOpenRef ?? null },
+      binding: {
+        provider,
+        ...(action.nativeProvider === undefined ? {} : { nativeProvider: action.nativeProvider }),
+        nativeSessionId,
+        nativeOpenRef: action.binding.nativeOpenRef ?? null,
+      },
       model: action.model,
       thinking: action.thinking,
       permissionMode: action.permissionMode,
@@ -569,6 +598,7 @@ export class VisibleTeamStore {
     workspaceId: string;
     displayName: string;
     provider: string;
+    nativeProvider?: string;
     nativeSessionId: string;
     nativeOpenRef?: string;
     model?: string;
@@ -583,6 +613,7 @@ export class VisibleTeamStore {
       displayName: input.displayName,
       binding: {
         provider: cleanText(input.provider, "provider", { required: true, max: 100 }),
+        ...(input.nativeProvider === undefined ? {} : { nativeProvider: input.nativeProvider }),
         nativeSessionId: cleanText(input.nativeSessionId, "nativeSessionId", { required: true, max: 500 }),
         nativeOpenRef: input.nativeOpenRef ?? null,
       },
@@ -610,6 +641,7 @@ export class VisibleTeamStore {
     const nativeSessionId = cleanText(input.binding.nativeSessionId, "binding.nativeSessionId", { required: true, max: 500 });
     const displayName = cleanText(input.displayName, "displayName", { required: true, max: 200 });
     const nativeOpenRef = nullableText(input.binding.nativeOpenRef, "binding.nativeOpenRef", 2_000);
+    const nativeProvider = nullableText(input.binding.nativeProvider, "binding.nativeProvider", 200);
     const model = nullableText(input.model, "model", 200);
     const thinking = nullableText(input.thinking, "thinking", 200);
     const permissionMode = nullableText(input.permissionMode, "permissionMode", 200);
@@ -628,8 +660,20 @@ export class VisibleTeamStore {
         throw new Error(`native session is already attached to workspace ${String(existing.workspace_id)}`);
       }
       if (existing) {
+        const timestamp = now();
+        // Re-attaching is idempotent for identity/bootstrap ownership, but a
+        // later explicit route is allowed to fill metadata that an earlier
+        // state-only attach did not know. No new context packet is created.
+        this.db.prepare(`
+          UPDATE vt_agents
+          SET native_provider = COALESCE(?, native_provider),
+              model = COALESCE(?, model),
+              thinking = COALESCE(?, thinking),
+              permission_mode = COALESCE(?, permission_mode),
+              updated_at = ?
+          WHERE agent_id = ?
+        `).run(nativeProvider, model, thinking, permissionMode, timestamp, String(existing.agent_id));
         if (input.asLeader) {
-          const timestamp = now();
           this.db.prepare("UPDATE vt_workspaces SET leader_agent_id = ?, version = version + 1, updated_at = ? WHERE workspace_id = ?")
             .run(String(existing.agent_id), timestamp, input.workspaceId);
         }
@@ -642,14 +686,15 @@ export class VisibleTeamStore {
       const timestamp = now();
       this.db.prepare(`
         INSERT INTO vt_agents(agent_id, workspace_id, display_name, provider,
-          native_session_id, native_open_ref, model, thinking, permission_mode,
+          native_provider, native_session_id, native_open_ref, model, thinking, permission_mode,
           responsibility, status, attach_source, context_version, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, 0, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, 0, ?, ?)
       `).run(
         agentId,
         input.workspaceId,
         displayName,
         provider,
+        nativeProvider,
         nativeSessionId,
         nativeOpenRef,
         model,

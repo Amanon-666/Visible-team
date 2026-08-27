@@ -14,6 +14,7 @@ import {
   type WorkspaceAction,
   type WorkspaceCommandResult,
 } from "../shared/types.js";
+import { disposeTeamWorkbenchStyles, TeamWorkbench } from "./TeamWorkbench.js";
 
 type Listener = () => void;
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
@@ -512,7 +513,10 @@ export function apply(ctx: ClientContext): void {
   const sessions = ctx.sessions;
   ctx.effect(() => {
     team.start();
-    return () => team.dispose();
+    return () => {
+      disposeTeamWorkbenchStyles();
+      team.dispose();
+    };
   }, "visible-team: client state and event stream");
   ctx.slots.inject("conversation.view", () => ctx.slots.register({
     name: "conversation.view",
@@ -525,6 +529,13 @@ export function apply(ctx: ClientContext): void {
       openSession: sessions?.open,
     }),
   }, TeamView));
+  ctx.slots.inject("sidebar.footer.action", () => ctx.slots.register({
+    name: "sidebar.footer.action",
+    id: "visible-team-workbench",
+    order: 20,
+    label: "协作工作台",
+    inject: () => ({ team }),
+  }, TeamWorkbench));
 }
 
-export { TeamView };
+export { TeamView, TeamWorkbench };
